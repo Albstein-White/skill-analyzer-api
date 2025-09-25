@@ -39,10 +39,21 @@ app = FastAPI(title="Skill Analyzer API")
 def root():
     return {"status": "ok", "service": "skill-analyzer-api"}
 
-# Allow your web origin here in prod
+from fastapi.middleware.cors import CORSMiddleware
+
+ALLOWED_ORIGINS = [
+    "https://skill-tier.com",
+    "https://www.skill-tier.com",
+    "http://localhost:3000",
+    "https://bolt.new/~/sb1-zfve5vhp",# dev
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,  # keep False unless you use cookies
 )
 
 # ---- Schemas ----
