@@ -34,6 +34,11 @@ NEXT_CACHE: dict[str, t.Any] = {}  # sid -> serialized next item
 
 app = FastAPI(title="Skill Analyzer API")
 
+# api/app.py, after `app = FastAPI(...)`
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "skill-analyzer-api"}
+
 # Allow your web origin here in prod
 app.add_middleware(
     CORSMiddleware,
