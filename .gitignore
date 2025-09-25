@@ -1,0 +1,20 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.build/
+dist/
+
+# venvs
+.venv/
+venv/
+
+# local secrets
+.env
+.azure_config.json
+
+# artifacts
+reports/
+deploy.zip

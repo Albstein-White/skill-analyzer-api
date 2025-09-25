@@ -1,0 +1,16 @@
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skill-analyzer-mvp"
+version = "0.6.0"
+description = "Skill Analyzer MVP v5: difficulty-aware adaptive engine + robust OPEN scoring"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name="Your Name"}]
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["skill_core*", "app_cli*"]
