@@ -28,9 +28,30 @@ _load_azure_from_json()
 # ---- Engine imports ----
 from skill_core.engine import AdaptiveSession
 from skill_core.types import Answer
+from .storage import (
+    active_sessions_for_user,
+    clear_active_session,
+    delete_report,
+    find_report_by_session,
+    list_reports_for_user,
+    load_all_active_sessions,
+    load_report,
+    record_active_session,
+    save_report,
+    update_active_session,
+    utcnow_iso,
+)
 
 SESS: dict[str, AdaptiveSession] = {}
 NEXT_CACHE: dict[str, t.Any] = {}  # sid -> serialized next item
+SESSION_INFO: dict[str, dict[str, t.Any]] = {}
+
+for sid, payload in load_all_active_sessions().items():
+    SESSION_INFO[sid] = {
+        "user_id": payload.get("userId"),
+        "run": payload.get("run"),
+        "started_at": payload.get("startedAt"),
+    }
 
 app = FastAPI(title="Skill Analyzer API")
 
@@ -60,6 +81,7 @@ app.add_middleware(
 class StartReq(BaseModel):
     run: str            # "short" | "long"
     llm: str = "none"   # "none" | "azure" | "ollama"
+    user_id: str | None = None
 
 class AnswerReq(BaseModel):
     item_id: str
@@ -77,6 +99,38 @@ class FEFinish(BaseModel):
     session_id: str
 
 # ---- Helpers ----
+def _now_iso() -> str:
+    return utcnow_iso()
+
+
+def _serialize_result(res: t.Any) -> dict[str, t.Any]:
+    return json.loads(json.dumps(res, default=lambda o: getattr(o, "__dict__", o)))
+
+
+def _decorate_report(
+    base: dict[str, t.Any],
+    *,
+    session_id: str,
+    user_id: str | None,
+    report_id: str | None = None,
+    created_at: str | None = None,
+) -> dict[str, t.Any]:
+    rid = report_id or str(uuid.uuid4())
+    created = created_at or _now_iso()
+    report = dict(base)
+    meta = dict(report.get("meta") or {})
+    meta.setdefault("sessionId", session_id)
+    if user_id:
+        meta.setdefault("userId", user_id)
+    meta.setdefault("createdAt", created)
+    meta["reportId"] = rid
+    report["meta"] = meta
+    report["id"] = rid
+    report["reportId"] = rid
+    report["created_at"] = created
+    return report
+
+
 def _serialize_item(it):
     if it is None: return None
     return {
@@ -118,6 +172,20 @@ def start(req: StartReq):
     SESS[sid] = sess
     # do NOT advance here for the /api/test contract; NEXT will serve items
     NEXT_CACHE[sid] = _serialize_item(sess.next_item())
+    started_at = _now_iso()
+    SESSION_INFO[sid] = {"user_id": req.user_id, "run": req.run, "started_at": started_at}
+    if req.user_id:
+        record_active_session(
+            sid,
+            {
+                "sessionId": sid,
+                "userId": req.user_id,
+                "run": req.run,
+                "startedAt": started_at,
+                "lastUpdated": started_at,
+                "lastItem": 0,
+            },
+        )
     return {"session_id": sid, "item": NEXT_CACHE[sid]}  # kept for backward compatibility
 
 @app.post("/session/{sid}/answer")
@@ -133,19 +201,30 @@ def answer(sid: str, req: AnswerReq):
 
 @app.get("/session/{sid}/report")
 def report(sid: str):
+    stored = find_report_by_session(sid)
+    if stored:
+        return stored
     sess = SESS.get(sid)
-    if not sess: raise HTTPException(404, "session not found")
-    res = sess.finalize()
-    return json.loads(json.dumps(res, default=lambda o: getattr(o, "__dict__", o)))
+    if not sess:
+        raise HTTPException(404, "session not found")
+    info = SESSION_INFO.get(sid, {})
+    res = _serialize_result(sess.finalize())
+    return _decorate_report(res, session_id=sid, user_id=info.get("user_id"))
 
 @app.get("/session/{sid}/report/html")
 def report_html_endpoint(sid: str):
     from skill_core.report_html import export_report_html
     import tempfile, json as _json
-    sess = SESS.get(sid)
-    if not sess: raise HTTPException(404, "session not found")
-    res = sess.finalize()
-    d = _json.loads(_json.dumps(res, default=lambda o: getattr(o,"__dict__",o)))
+    stored = find_report_by_session(sid)
+    if stored:
+        d = stored
+    else:
+        sess = SESS.get(sid)
+        if not sess:
+            raise HTTPException(404, "session not found")
+        info = SESSION_INFO.get(sid, {})
+        res = _serialize_result(sess.finalize())
+        d = _decorate_report(res, session_id=sid, user_id=info.get("user_id"))
     with tempfile.NamedTemporaryFile("w+", suffix=".html", delete=False, encoding="utf-8") as f:
         export_report_html(d, f.name)
         f.seek(0)
@@ -176,13 +255,68 @@ def test_answer(payload: FEAnswer = Body(...)):
     except Exception: pass
     sess.answer_current(Answer(item_id=payload.item_id, value=val, rt_sec=(rt_ms/1000.0 if rt_ms else None)))
     NEXT_CACHE[payload.session_id] = _serialize_item(sess.next_item())
+    meta = SESSION_INFO.get(payload.session_id, {})
+    if meta.get("user_id"):
+        update_active_session(
+            payload.session_id,
+            {
+                "lastUpdated": _now_iso(),
+                "lastItem": getattr(sess, "_step", None),
+            },
+        )
     return {"ok": True, "next_available": NEXT_CACHE[payload.session_id] is not None}
 
 @app.post("/api/test/finish")
 def test_finish(payload: FEFinish):
     sess = SESS.get(payload.session_id)
     if not sess: raise HTTPException(404, "session not found")
-    res = sess.finalize()
-    # optional: cleanup caches
+    info = SESSION_INFO.get(payload.session_id, {})
+    res = _serialize_result(sess.finalize())
+    report = _decorate_report(
+        res,
+        session_id=payload.session_id,
+        user_id=info.get("user_id"),
+    )
+    metadata = {
+        "sessionId": payload.session_id,
+        "userId": info.get("user_id"),
+        "createdAt": report["created_at"],
+        "run": info.get("run") or report.get("run_type"),
+        "kind": info.get("run") or report.get("run_type"),
+        "summary": report.get("summary"),
+    }
+    save_report(report["id"], report, metadata)
+    if info.get("user_id"):
+        clear_active_session(payload.session_id)
     NEXT_CACHE.pop(payload.session_id, None)
-    return json.loads(json.dumps(res, default=lambda o: getattr(o, "__dict__", o)))
+    SESS.pop(payload.session_id, None)
+    SESSION_INFO.pop(payload.session_id, None)
+    return report
+
+
+@app.get("/reports/{report_id}")
+def get_report(report_id: str):
+    report = load_report(report_id)
+    if not report:
+        raise HTTPException(404, "report not found")
+    return report
+
+
+@app.delete("/reports/{report_id}")
+def delete_report_endpoint(report_id: str):
+    ok = delete_report(report_id)
+    if not ok:
+        raise HTTPException(404, "report not found")
+    return {"ok": True}
+
+
+@app.get("/users/{user_id}/reports")
+def list_reports(user_id: str):
+    reports = list_reports_for_user(user_id)
+    return {"reports": reports}
+
+
+@app.get("/users/{user_id}/sessions/active")
+def list_active_sessions(user_id: str):
+    sessions = active_sessions_for_user(user_id)
+    return {"sessions": sessions}
