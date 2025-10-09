@@ -20,7 +20,13 @@ class Answer:
     item_id: str; value: str; rt_sec: Optional[float] = None
 @dataclass
 class DomainScore:
-    domain: str; theta: float; se: float; norm_score: float; tier: str; rarity: str
+    domain: str
+    theta: float
+    se: float
+    norm_score: float
+    tier: str
+    rarity: str
+    reliability: Optional[Dict[str, object]] = None
 @dataclass
 class HiddenSkill:
     domain: str; confidence: Literal["Low","Medium","High"]; reason: str
@@ -35,3 +41,5 @@ class Result:
     synergy_boost: float
     unique_award: Optional[str] = None
     summary: Dict[str, float] = field(default_factory=dict)
+    plan: List[Dict[str, object]] = field(default_factory=list)
+    audit_events: List[Dict[str, object]] = field(default_factory=list)
