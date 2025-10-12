@@ -79,6 +79,7 @@ SR_START_SHIFT: dict[str, int] = {"low": -1, "mid": 0, "high": 1}
 BANK_MIN_PER_BUCKET_OBJ: int = 20
 BANK_MIN_PER_BUCKET_OPEN: int = 10
 BANK_EXPECT_VARIANT_GROUP: bool = True
+BANK_AUDIT_ALLOW_WARN: bool = False
 
 AUDIT_EXPORT_ENABLED: bool = True
 
@@ -116,6 +117,7 @@ DEBUG_TRACE = _env_bool("DEBUG_TRACE", False)
 DEBUG_SEED = os.getenv("DEBUG_SEED", None)
 STAGING_PROFILE = _env_bool("STAGING_PROFILE", False)
 AUDIT_EXPORT_ENABLED = _env_bool("AUDIT_EXPORT_ENABLED", AUDIT_EXPORT_ENABLED)
+BANK_AUDIT_ALLOW_WARN = _env_bool("BANK_AUDIT_ALLOW_WARN", BANK_AUDIT_ALLOW_WARN)
 
 def _env_true(name: str) -> bool:
     return os.environ.get(name, "").lower() in ("1","true","yes","on")

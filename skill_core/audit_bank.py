@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 from pathlib import Path
 from typing import Iterable
 
@@ -21,14 +22,28 @@ def _blank_domain() -> dict[str, object]:
     }
 
 
-def audit_items(items: Iterable[Item]) -> dict[str, object]:
+def audit_items(
+    items: Iterable[Item],
+    *,
+    min_obj: int | None = None,
+    min_open: int | None = None,
+    require_variant_group: bool | None = None,
+) -> dict[str, object]:
     coverage: dict[str, dict[str, object]] = {domain: _blank_domain() for domain in DOMAINS}
     totals = {"MCQ": 0, "SJT": 0, "OPEN": 0, "missing_variant_group": 0}
+
+    min_obj = config.BANK_MIN_PER_BUCKET_OBJ if min_obj is None else int(min_obj)
+    min_open = config.BANK_MIN_PER_BUCKET_OPEN if min_open is None else int(min_open)
+    require_variant_group = (
+        config.BANK_EXPECT_VARIANT_GROUP
+        if require_variant_group is None
+        else bool(require_variant_group)
+    )
 
     for item in items:
         domain_data = coverage.setdefault(item.domain, _blank_domain())
 
-        if not item.variant_group and config.BANK_EXPECT_VARIANT_GROUP:
+        if not getattr(item, "variant_group", None):
             domain_data["missing_variant_group"] += 1
             totals["missing_variant_group"] += 1
 
@@ -52,23 +67,23 @@ def audit_items(items: Iterable[Item]) -> dict[str, object]:
         open_map = data["OPEN"]  # type: ignore[assignment]
 
         for lvl in OBJ_BUCKETS:
-            if mcq.get(lvl, 0) < config.BANK_MIN_PER_BUCKET_OBJ:
+            if mcq.get(lvl, 0) < min_obj:
                 warnings.append(
-                    f"{domain} MCQ level {lvl:+d} has {mcq.get(lvl, 0)} (<{config.BANK_MIN_PER_BUCKET_OBJ})"
+                    f"{domain} MCQ level {lvl:+d} has {mcq.get(lvl, 0)} (<{min_obj})"
                 )
-            if sjt.get(lvl, 0) < config.BANK_MIN_PER_BUCKET_OBJ:
+            if sjt.get(lvl, 0) < min_obj:
                 warnings.append(
-                    f"{domain} SJT level {lvl:+d} has {sjt.get(lvl, 0)} (<{config.BANK_MIN_PER_BUCKET_OBJ})"
+                    f"{domain} SJT level {lvl:+d} has {sjt.get(lvl, 0)} (<{min_obj})"
                 )
 
         for lvl in OPEN_BUCKETS:
-            if open_map.get(lvl, 0) < config.BANK_MIN_PER_BUCKET_OPEN:
+            if open_map.get(lvl, 0) < min_open:
                 warnings.append(
-                    f"{domain} OPEN level {lvl:+d} has {open_map.get(lvl, 0)} (<{config.BANK_MIN_PER_BUCKET_OPEN})"
+                    f"{domain} OPEN level {lvl:+d} has {open_map.get(lvl, 0)} (<{min_open})"
                 )
 
         missing_vg = data["missing_variant_group"]  # type: ignore[assignment]
-        if missing_vg and config.BANK_EXPECT_VARIANT_GROUP:
+        if missing_vg and require_variant_group:
             warnings.append(f"{domain} has {missing_vg} items missing variant_group")
 
     summary = {"coverage": coverage, "warnings": warnings, "totals": totals}
@@ -115,11 +130,28 @@ def write_summary(summary: dict[str, object], path: Path = Path("/tmp/bank_audit
 
 
 def main(_argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Audit bank coverage for adaptive ladder readiness")
+    parser.add_argument("--allow-warn", dest="allow_warn", action="store_true", help="exit with status 0 even when warnings are present")
+    parser.add_argument("--min-obj", type=int, default=None, help="override minimum MCQ/SJT items per difficulty bucket")
+    parser.add_argument("--min-open", type=int, default=None, help="override minimum OPEN items per difficulty bucket")
+    parser.add_argument("--no-vg-required", action="store_true", help="suppress missing variant_group warnings")
+    args = parser.parse_args(_argv)
+
     items = load_bank()
-    summary = audit_items(items)
+    summary = audit_items(
+        items,
+        min_obj=args.min_obj,
+        min_open=args.min_open,
+        require_variant_group=False if args.no_vg_required else None,
+    )
     print_report(summary)
     write_summary(summary)
-    return 2 if summary["warnings"] else 0
+    allow_warn = args.allow_warn or config.BANK_AUDIT_ALLOW_WARN
+    exit_code = 0 if (allow_warn or not summary["warnings"]) else 2
+    print(
+        f"AUDIT: exit={exit_code} warnings={len(summary['warnings'])} allow_warn={bool(allow_warn)}"
+    )
+    return exit_code
 
 
 if __name__ == "__main__":
