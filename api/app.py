@@ -1,5 +1,5 @@
 from __future__ import annotations
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uuid, os, json, time, pathlib, typing as t
@@ -28,6 +28,9 @@ _load_azure_from_json()
 # ---- Engine imports ----
 from skill_core.engine import AdaptiveSession
 from skill_core.types import Answer
+from skill_core.plan import generate_plan
+from skill_core.config import load_config, AUDIT_EXPORT_ENABLED
+from skill_core.audit_export import to_json as audit_to_json, to_csv as audit_to_csv
 from .storage import (
     active_sessions_for_user,
     clear_active_session,
@@ -300,6 +303,66 @@ def get_report(report_id: str):
     if not report:
         raise HTTPException(404, "report not found")
     return report
+
+
+@app.post("/results/{report_id}/plan")
+def create_plan(report_id: str, force: bool = Query(False, description="Regenerate even if cached")):
+    report = load_report(report_id)
+    if not report:
+        raise HTTPException(404, "result not found")
+
+    existing = report.get("plan") if isinstance(report, dict) else None
+    if existing and not force:
+        return {"result_id": report_id, "plan": existing}
+
+    cfg = load_config()
+    plan = generate_plan(report, cfg)
+    if isinstance(report, dict):
+        report["plan"] = plan
+        meta = report.get("meta") or {}
+        metadata = {
+            "sessionId": meta.get("sessionId"),
+            "userId": meta.get("userId"),
+            "createdAt": report.get("created_at") or meta.get("createdAt"),
+            "run": meta.get("run") or meta.get("kind") or report.get("run_type"),
+            "kind": meta.get("run") or meta.get("kind") or report.get("run_type"),
+            "summary": report.get("summary"),
+        }
+        save_report(report_id, report, metadata)
+    return {"result_id": report_id, "plan": plan}
+
+
+@app.get("/results/{report_id}/audit.json")
+def get_audit_json(report_id: str):
+    if not AUDIT_EXPORT_ENABLED:
+        raise HTTPException(404, "audit export disabled")
+
+    report = load_report(report_id)
+    if not report:
+        raise HTTPException(404, "result not found")
+
+    events = report.get("audit_events") if isinstance(report, dict) else None
+    payload = audit_to_json(events or [])
+    return {"result_id": report_id, **payload}
+
+
+@app.get("/results/{report_id}/audit.csv")
+def get_audit_csv(report_id: str):
+    if not AUDIT_EXPORT_ENABLED:
+        raise HTTPException(404, "audit export disabled")
+
+    report = load_report(report_id)
+    if not report:
+        raise HTTPException(404, "result not found")
+
+    events = report.get("audit_events") if isinstance(report, dict) else None
+    body = audit_to_csv(events or [])
+    filename = f"{report_id}_audit.csv"
+    return Response(
+        content=body,
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
+    )
 
 
 @app.delete("/reports/{report_id}")
