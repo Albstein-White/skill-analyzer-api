@@ -79,7 +79,16 @@ def export_report_html(result: Dict[str, Any], path: str) -> None:
     open_sections: List[str] = []
     for d in doms:
         contribs = d.get('open_contrib') or []
+        reason_txt = str(d.get('open_debug_reason') or '').strip()
+        open_count = int(d.get('open_count', 0) or 0)
         if not contribs:
+            if open_count == 0 and reason_txt:
+                open_sections.append(
+                    '<div>'
+                    + f"<h4>{d.get('domain')}</h4>"
+                    + f"<p>OPEN not scheduled: {reason_txt}</p>"
+                    + '</div>'
+                )
             continue
         lines: List[str] = []
         for entry in contribs:

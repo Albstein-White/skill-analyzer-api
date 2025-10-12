@@ -369,6 +369,7 @@ class DomainState:
     open_info_total: float = 0.0
     sr_trap_count: int = 0
     sr_mirror_ok: bool = True
+    open_debug_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, object]:
         """JSON-friendly representation used for persistence/debugging."""
@@ -401,6 +402,7 @@ class DomainState:
             "open_info_total": self.open_info_total,
             "sr_trap_count": self.sr_trap_count,
             "sr_mirror_ok": self.sr_mirror_ok,
+            "open_debug_reason": self.open_debug_reason,
         }
 
 @dataclass
@@ -550,6 +552,8 @@ class AdaptiveSession:
             dh.open_contrib = list(st.open_contrib)
             dh.obj_info_total = st.obj_info_total
             dh.open_info_total = st.open_info_total
+            dh.b_stable = st.b_stable
+            dh.open_debug_reason = getattr(st, "open_debug_reason", None)
             hist[d] = dh
         return PolicyState(
             run_type=self.run_type, theta=theta_map, se=se_map, asked=set(self.asked),
@@ -591,6 +595,10 @@ class AdaptiveSession:
         st = self._policy_state()
         if self.policy.should_stop(st): return None
         it = self.policy.next_item(st)
+        if hasattr(self.policy, "_open_debug"):
+            for dom, reason in getattr(self.policy, "_open_debug", {}).items():
+                if dom in self.state.domains:
+                    self.state.domains[dom].open_debug_reason = reason
         self._current = it
         if it is not None:
             vg = getattr(it, "variant_group", None)
@@ -925,6 +933,7 @@ class AdaptiveSession:
             setattr(ds, "open_contrib", list(st.open_contrib))
             setattr(ds, "obj_info_total", st.obj_info_total)
             setattr(ds, "open_info_total", st.open_info_total)
+            setattr(ds, "open_debug_reason", getattr(st, "open_debug_reason", None))
 
             items_by_level: Dict[int, int] = {}
             accuracy_by_level: Dict[int, float] = {}

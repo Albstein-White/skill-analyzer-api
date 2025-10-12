@@ -25,6 +25,9 @@ from .config import (
     OPEN_GATE2_MIN_R1,
     OPEN_LEVELS,
     OPEN_Z_SHIFT,
+    OPEN_FALLBACK_AFTER_OBJ,
+    OPEN_FALLBACK_MIN_STABLE,
+    OPEN_DEBUG_REASON,
     SR_PER_DOMAIN_SHORT,
     SR_PER_DOMAIN_LONG,
     DEBUG_SEED,
@@ -50,6 +53,8 @@ class DomainHistory:
     open_contrib: List[Dict[str, object]] = field(default_factory=list)
     obj_info_total: float = 0.0
     open_info_total: float = 0.0
+    b_stable: int = 0
+    open_debug_reason: Optional[str] = None
 
 
 @dataclass
@@ -89,6 +94,7 @@ class QuestionPolicy:
             d: {lvl: [] for lvl in self._open_levels} for d in DOMAINS
         }
         self._last_pick_was_sr = False
+        self._open_debug: Dict[str, Optional[str]] = {d: None for d in DOMAINS}
 
         for it in items:
             domain = getattr(it, "domain", None)
@@ -284,57 +290,114 @@ class QuestionPolicy:
             return []
 
         candidates: List[Tuple[str, object, float, int, int, int]] = []
+        debug_updates: Optional[Dict[str, Optional[str]]] = (
+            {d: None for d in DOMAINS} if OPEN_DEBUG_REASON else None
+        )
         for domain in DOMAINS:
             hist = st.hist.get(domain, DomainHistory())
             if hist.open_count >= 2:
+                if debug_updates is not None:
+                    debug_updates[domain] = None
                 continue
 
             se_val = st.se.get(domain, 1.0)
             theta_val = st.theta.get(domain, 0.0)
             target_level: Optional[int] = None
+            eligible = False
+            reason: Optional[str] = None
+            fallback_used = False
 
             if hist.open_count == 0:
-                if hist.obj_count < OPEN_GATE1_MIN_OBJ:
-                    continue
-                if se_val > OPEN_GATE1_SE_MAX:
-                    continue
-                target_level = self._pick_open_level(theta_val)
+                gate_ok = (
+                    hist.obj_count >= OPEN_GATE1_MIN_OBJ
+                    and se_val <= OPEN_GATE1_SE_MAX
+                )
+                if gate_ok:
+                    eligible = True
+                    target_level = self._pick_open_level(theta_val)
+                else:
+                    if hist.obj_count < OPEN_GATE1_MIN_OBJ:
+                        reason = "obj_lt_gate1"
+                    elif se_val > OPEN_GATE1_SE_MAX:
+                        reason = "se_too_high"
+                    else:
+                        reason = "gating"
+                    fallback_used = (
+                        self.run_type == "long"
+                        and hist.obj_count >= OPEN_FALLBACK_AFTER_OBJ
+                        and getattr(hist, "b_stable", hist.level) >= OPEN_FALLBACK_MIN_STABLE
+                    )
+                    if fallback_used:
+                        eligible = True
+                        target_level = self._pick_open_level(theta_val)
+                        reason = "fallback_obj"
+                    else:
+                        if debug_updates is not None:
+                            debug_updates[domain] = reason
+                        continue
             elif hist.open_count == 1:
                 if hist.obj_count < OPEN_GATE1_MIN_OBJ:
+                    reason = "obj_lt_gate2"
+                elif se_val > OPEN_GATE2_SE_MAX:
+                    reason = "se_too_high"
+                elif not hist.open_contrib:
+                    reason = "open1_missing"
+                else:
+                    first = hist.open_contrib[0]
+                    if first.get("ignored") is not None:
+                        reason = "open1_ignored"
+                    else:
+                        r1 = float(first.get("r", 0.0))
+                        if r1 < OPEN_GATE2_MIN_R1:
+                            reason = "r1_too_low"
+                        else:
+                            b1 = int(first.get("b", 0))
+                            mu1 = float(first.get("mu", 0.5))
+                            denom = max(mu1 * (1.0 - mu1), 1e-6)
+                            z1 = (r1 - mu1) / math.sqrt(denom)
+                            target_level = b1
+                            recent = hist.recent_window[-4:]
+                            last_two = recent[-2:] if len(recent) >= 2 else []
+                            has_miss = any(not x for x in hist.recent_window[-3:])
+                            if len(last_two) == 2 and all(last_two) and z1 >= OPEN_Z_SHIFT:
+                                target_level = min(b1 + 1, self._open_levels[-1])
+                            elif has_miss and z1 <= -OPEN_Z_SHIFT:
+                                target_level = max(b1 - 1, self._open_levels[0])
+                            eligible = True
+                if not eligible:
+                    fallback_used = (
+                        self.run_type == "long"
+                        and hist.obj_count >= OPEN_FALLBACK_AFTER_OBJ + 2
+                        and getattr(hist, "b_stable", hist.level) >= OPEN_FALLBACK_MIN_STABLE
+                    )
+                    if fallback_used:
+                        eligible = True
+                        target_level = self._pick_open_level(theta_val)
+                        reason = "fallback_obj2"
+                if not eligible:
+                    if debug_updates is not None:
+                        debug_updates[domain] = reason or "gating"
                     continue
-                if se_val > OPEN_GATE2_SE_MAX:
-                    continue
-                if not hist.open_contrib:
-                    continue
-                first = hist.open_contrib[0]
-                if first.get("ignored") is not None:
-                    continue
-                r1 = float(first.get("r", 0.0))
-                if r1 < OPEN_GATE2_MIN_R1:
-                    continue
-                b1 = int(first.get("b", 0))
-                mu1 = float(first.get("mu", 0.5))
-                denom = max(mu1 * (1.0 - mu1), 1e-6)
-                z1 = (r1 - mu1) / math.sqrt(denom)
-                target_level = b1
-                recent = hist.recent_window[-4:]
-                last_two = recent[-2:] if len(recent) >= 2 else []
-                has_miss = any(not x for x in hist.recent_window[-3:])
-                if len(last_two) == 2 and all(last_two) and z1 >= OPEN_Z_SHIFT:
-                    target_level = min(b1 + 1, self._open_levels[-1])
-                elif has_miss and z1 <= -OPEN_Z_SHIFT:
-                    target_level = max(b1 - 1, self._open_levels[0])
             else:
+                if debug_updates is not None:
+                    debug_updates[domain] = None
                 continue
 
             if target_level is None:
+                if debug_updates is not None and not fallback_used:
+                    debug_updates[domain] = reason or "gating"
                 continue
 
             item, served_level = self._select_open_item(
                 domain, int(target_level), st, peek=True
             )
             if item is None:
+                if debug_updates is not None:
+                    debug_updates[domain] = "no_items"
                 continue
+
+            if debug_updates is not None:
+                debug_updates[domain] = None if not fallback_used else reason
 
             candidates.append(
                 (
@@ -346,6 +409,9 @@ class QuestionPolicy:
                     int(served_level if served_level is not None else target_level),
                 )
             )
+
+        if debug_updates is not None:
+            self._open_debug.update(debug_updates)
 
         return candidates
 

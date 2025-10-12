@@ -9,18 +9,22 @@ from fastapi.testclient import TestClient
 
 from skill_core.config import PLAN_BULLETS_MAX, PLAN_BULLETS_MIN, PLAN_FOCUS_MAX
 
+_MODULES = [
+    "skill_core.config",
+    "skill_core.plan",
+    "api.storage",
+    "api.app",
+]
+
 
 def _reload_app(tmp_path) -> tuple[object, object]:
     os.environ["DATA_DIR"] = str(tmp_path)
-    if "api.storage" in sys.modules:
-        importlib.reload(sys.modules["api.storage"])
-    else:
-        import api.storage  # noqa: F401
+    for name in _MODULES:
+        if name in sys.modules:
+            importlib.reload(sys.modules[name])
+        else:
+            __import__(name)
     storage = sys.modules["api.storage"]
-    if "api.app" in sys.modules:
-        importlib.reload(sys.modules["api.app"])
-    else:
-        import api.app  # noqa: F401
     app_module = sys.modules["api.app"]
     return storage, app_module
 
@@ -31,7 +35,8 @@ def _write_report(storage, report_id: str, payload: dict) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def test_plan_endpoint_idempotent(tmp_path):
+def test_plan_endpoint_idempotent_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("PLAN_ENABLED", "1")
     storage, app_module = _reload_app(tmp_path)
     client = TestClient(app_module.app)
 
@@ -96,4 +101,31 @@ def test_plan_endpoint_idempotent(tmp_path):
     resp_short = client.post("/results/report-short/plan")
     assert resp_short.status_code == 200
     assert resp_short.json().get("plan") == []
+
+
+def test_plan_endpoint_disabled_returns_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("PLAN_ENABLED", "0")
+    storage, app_module = _reload_app(tmp_path)
+    client = TestClient(app_module.app)
+
+    long_payload = {
+        "run_type": "long",
+        "summary": {"total_items": 120},
+        "meta": {"run": "long", "total_items": 120},
+        "domain_scores": [
+            {
+                "domain": "Analytical",
+                "tier": "D",
+                "theta": -0.2,
+                "se": 0.35,
+                "b_stable": 0,
+            }
+        ],
+    }
+
+    _write_report(storage, "report-disabled", long_payload)
+
+    resp = client.post("/results/report-disabled/plan")
+    assert resp.status_code == 200
+    assert resp.json().get("plan") == []
 
