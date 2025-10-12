@@ -1,5 +1,6 @@
 from __future__ import annotations
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Query, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uuid, os, json, time, pathlib, typing as t
@@ -28,6 +29,9 @@ _load_azure_from_json()
 # ---- Engine imports ----
 from skill_core.engine import AdaptiveSession
 from skill_core.types import Answer
+from skill_core.plan import generate_plan
+from skill_core.config import load_config, AUDIT_EXPORT_ENABLED, GLOBAL_STEP_CAP
+from skill_core.audit_export import to_json as audit_to_json, to_csv as audit_to_csv
 from .storage import (
     active_sessions_for_user,
     clear_active_session,
@@ -54,6 +58,12 @@ for sid, payload in load_all_active_sessions().items():
     }
 
 app = FastAPI(title="Skill Analyzer API")
+
+# Wire developer utilities only when explicitly enabled for staging/ops
+if os.getenv("STAGING_PROFILE", "0").lower() in {"1", "true", "yes", "on"}:
+    from . import dev as _dev  # noqa: WPS433 (intentional local import)
+
+    app.include_router(_dev.router)
 
 # api/app.py, after `app = FastAPI(...)`
 @app.get("/")
@@ -196,8 +206,77 @@ def answer(sid: str, req: AnswerReq):
     try: val = int(val)
     except Exception: pass
     sess.answer_current(Answer(item_id=req.item_id, value=val, rt_sec=(req.rt_ms/1000.0 if req.rt_ms else None)))
+    if sess.steps >= GLOBAL_STEP_CAP:
+        sess.mark_done()
+    nxt = None
+    if not sess.done:
+        nxt = sess.next_item()
+    serialized = _serialize_item(nxt) if nxt is not None else None
+    if serialized is not None:
+        NEXT_CACHE[sid] = serialized
+    else:
+        NEXT_CACHE.pop(sid, None)
+    return {"done": nxt is None, "item": serialized}
+
+
+@app.get("/session/{sid}/next")
+def next_item_endpoint(sid: str):
+    sess = SESS.get(sid)
+    if not sess:
+        raise HTTPException(404, "session not found")
+    if sess.done:
+        NEXT_CACHE.pop(sid, None)
+        return Response(status_code=204)
+    cached = NEXT_CACHE.get(sid)
+    if cached is not None:
+        return {"item": cached}
     nxt = sess.next_item()
-    return {"done": nxt is None, "item": _serialize_item(nxt)}
+    if nxt is None:
+        sess.mark_done()
+        NEXT_CACHE.pop(sid, None)
+        return Response(status_code=204)
+    serialized = _serialize_item(nxt)
+    NEXT_CACHE[sid] = serialized
+    return {"item": serialized}
+
+
+@app.post("/session/finish")
+def finish(req: FEFinish):
+    sess = SESS.get(req.session_id)
+    if not sess:
+        raise HTTPException(404, "session not found")
+    if not sess.done and sess.steps < GLOBAL_STEP_CAP:
+        return JSONResponse({"status": "continue", "steps": sess.steps}, status_code=409)
+    info = SESSION_INFO.get(req.session_id, {})
+    result = _serialize_result(sess.finalize())
+    snapshot = sess.summary()
+    summary = dict(result.get("summary") or {})
+    summary["steps_used"] = snapshot.get("steps_used", sess.steps)
+    summary["sr_used"] = snapshot.get("sr_used", 0)
+    summary["open_used"] = snapshot.get("open_used", 0)
+    summary["cap"] = f"{summary['steps_used']}/{GLOBAL_STEP_CAP}"
+    summary.setdefault("cap_limit", snapshot.get("cap_limit"))
+    result["summary"] = summary
+    report = _decorate_report(
+        result,
+        session_id=req.session_id,
+        user_id=info.get("user_id"),
+    )
+    metadata = {
+        "sessionId": req.session_id,
+        "userId": info.get("user_id"),
+        "createdAt": report["created_at"],
+        "run": info.get("run") or report.get("run_type"),
+        "kind": info.get("run") or report.get("run_type"),
+        "summary": report.get("summary"),
+    }
+    save_report(report["id"], report, metadata)
+    if info.get("user_id"):
+        clear_active_session(req.session_id)
+    NEXT_CACHE.pop(req.session_id, None)
+    SESS.pop(req.session_id, None)
+    SESSION_INFO.pop(req.session_id, None)
+    return report
 
 @app.get("/session/{sid}/report")
 def report(sid: str):
@@ -300,6 +379,66 @@ def get_report(report_id: str):
     if not report:
         raise HTTPException(404, "report not found")
     return report
+
+
+@app.post("/results/{report_id}/plan")
+def create_plan(report_id: str, force: bool = Query(False, description="Regenerate even if cached")):
+    report = load_report(report_id)
+    if not report:
+        raise HTTPException(404, "result not found")
+
+    existing = report.get("plan") if isinstance(report, dict) else None
+    if existing and not force:
+        return {"result_id": report_id, "plan": existing}
+
+    cfg = load_config()
+    plan = generate_plan(report, cfg)
+    if isinstance(report, dict):
+        report["plan"] = plan
+        meta = report.get("meta") or {}
+        metadata = {
+            "sessionId": meta.get("sessionId"),
+            "userId": meta.get("userId"),
+            "createdAt": report.get("created_at") or meta.get("createdAt"),
+            "run": meta.get("run") or meta.get("kind") or report.get("run_type"),
+            "kind": meta.get("run") or meta.get("kind") or report.get("run_type"),
+            "summary": report.get("summary"),
+        }
+        save_report(report_id, report, metadata)
+    return {"result_id": report_id, "plan": plan}
+
+
+@app.get("/results/{report_id}/audit.json")
+def get_audit_json(report_id: str):
+    if not AUDIT_EXPORT_ENABLED:
+        raise HTTPException(404, "audit export disabled")
+
+    report = load_report(report_id)
+    if not report:
+        raise HTTPException(404, "result not found")
+
+    events = report.get("audit_events") if isinstance(report, dict) else None
+    payload = audit_to_json(events or [])
+    return {"result_id": report_id, **payload}
+
+
+@app.get("/results/{report_id}/audit.csv")
+def get_audit_csv(report_id: str):
+    if not AUDIT_EXPORT_ENABLED:
+        raise HTTPException(404, "audit export disabled")
+
+    report = load_report(report_id)
+    if not report:
+        raise HTTPException(404, "result not found")
+
+    events = report.get("audit_events") if isinstance(report, dict) else None
+    body = audit_to_csv(events or [])
+    filename = f"{report_id}_audit.csv"
+    return Response(
+        content=body,
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
+    )
 
 
 @app.delete("/reports/{report_id}")
