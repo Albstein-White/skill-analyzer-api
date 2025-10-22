@@ -57,6 +57,16 @@ GOD_MIN_OPEN: int = GOD_MIN_OPEN_DEFAULT
 GOD_MIN_R1: float = 0.80
 GOD_MIN_R2: float = 0.75
 
+# Minimum tier required before serving OPEN items in long runs
+OPEN_MIN_TIER: str = "A"
+
+# Production GOD probe (disabled by default)
+PROD_GOD_ENABLE: bool = False
+GOD_PROBE_MIN_FIRST: float = 0.85
+GOD_PROBE_MIN_SECOND: float = 0.85
+GOD_PROBE_DIFFICULTY: float = 1.0
+GOD_PROBE_EXEMPT_FROM_CAP: bool = False
+
 SE_TARGET_SHORT: float = 0.35
 SE_TARGET_LONG: float = 0.25
 
@@ -127,6 +137,8 @@ TEST_GOD_MIN_L2_ACC: float | None = None
 TEST_GOD_MIN_OPEN: int | None = None
 TEST_GOD_RUBRIC0: float | None = None
 TEST_GOD_RUBRIC1: float | None = None
+TEST_GOD_MIN_OPEN_RUBRIC: float | None = None
+TEST_GOD_MIN_OPEN_RUBRIC_SEC: float | None = None
 OPEN_RESERVE_FORCE: bool = False
 TRACE_FIELDS: tuple[str, ...] = (
     "domain",
@@ -140,6 +152,18 @@ TRACE_FIELDS: tuple[str, ...] = (
     "se",
     "info_gain",
 )
+
+# Fail-fast & extras gating
+SHORT_EXTRAS_REQUIRE_PROGRESS: bool = True
+SHORT_EXTRAS_SE_MAX: float = 0.45
+SHORT_FAIL_FAST_WINDOW: int = 12
+SHORT_FAIL_FAST_MAX_CORRECT: int = 3
+
+LONG_EARLY_STOP_ENABLE: bool = True
+LONG_EARLY_STOP_AFTER: int = 80
+LONG_FAIL_FAST_WINDOW: int = 20
+LONG_FAIL_FAST_MAX_CORRECT: int = 5
+LONG_MIN_INFO_GAIN: float = 0.015
 # // env overrides for staging/ops; defaults remain conservative.
 PLAN_ENABLED = _env_bool("PLAN_ENABLED", PLAN_ENABLED)
 OPEN_ENABLED_LONG = _env_bool("OPEN_ENABLED_LONG", OPEN_ENABLED_LONG)
@@ -157,6 +181,29 @@ TEST_GOD_MIN_L2_ACC = _env_float("TEST_GOD_MIN_L2_ACC", TEST_GOD_MIN_L2_ACC)
 TEST_GOD_MIN_OPEN = _env_int("TEST_GOD_MIN_OPEN", TEST_GOD_MIN_OPEN or 0)
 TEST_GOD_RUBRIC0 = _env_float("TEST_GOD_RUBRIC0", TEST_GOD_RUBRIC0)
 TEST_GOD_RUBRIC1 = _env_float("TEST_GOD_RUBRIC1", TEST_GOD_RUBRIC1)
+TEST_GOD_MIN_OPEN_RUBRIC = _env_float(
+    "TEST_GOD_MIN_OPEN_RUBRIC", TEST_GOD_MIN_OPEN_RUBRIC
+)
+TEST_GOD_MIN_OPEN_RUBRIC_SEC = _env_float(
+    "TEST_GOD_MIN_OPEN_RUBRIC_SEC", TEST_GOD_MIN_OPEN_RUBRIC_SEC
+)
+PROD_GOD_ENABLE = _env_bool("PROD_GOD_ENABLE", PROD_GOD_ENABLE)
+_probe_min_first = _env_float("GOD_PROBE_MIN_FIRST", GOD_PROBE_MIN_FIRST)
+if _probe_min_first is not None:
+    GOD_PROBE_MIN_FIRST = float(_probe_min_first)
+_probe_min_second = _env_float("GOD_PROBE_MIN_SECOND", GOD_PROBE_MIN_SECOND)
+if _probe_min_second is not None:
+    GOD_PROBE_MIN_SECOND = float(_probe_min_second)
+_probe_diff = _env_float("GOD_PROBE_DIFFICULTY", GOD_PROBE_DIFFICULTY)
+if _probe_diff is not None:
+    GOD_PROBE_DIFFICULTY = float(_probe_diff)
+GOD_PROBE_EXEMPT_FROM_CAP = _env_bool(
+    "GOD_PROBE_EXEMPT_FROM_CAP", GOD_PROBE_EXEMPT_FROM_CAP
+)
+
+# Convenience aliases used by GOD probe policy logic
+PROD_GOD_RUBRIC0: float = float(GOD_PROBE_MIN_FIRST)
+PROD_GOD_RUBRIC1: float = float(GOD_PROBE_MIN_SECOND)
 if TEST_GOD_MIN_L2_SEEN == 0 and TEST_GOD_MIN_L2_SEEN is not None:
     TEST_GOD_MIN_L2_SEEN = None
 if TEST_GOD_MIN_OPEN == 0 and TEST_GOD_MIN_OPEN is not None:
@@ -166,6 +213,27 @@ BANK_AUDIT_ALLOW_WARN = _env_bool("BANK_AUDIT_ALLOW_WARN", BANK_AUDIT_ALLOW_WARN
 
 if STAGING_PROFILE and TEST_MODE and TEST_OPEN_FULL:
     OPEN_RESERVE_FORCE = True
+
+SHORT_EXTRAS_REQUIRE_PROGRESS = _env_bool(
+    "SHORT_EXTRAS_REQUIRE_PROGRESS", SHORT_EXTRAS_REQUIRE_PROGRESS
+)
+_short_extras_se = _env_float("SHORT_EXTRAS_SE_MAX", SHORT_EXTRAS_SE_MAX)
+if _short_extras_se is not None:
+    SHORT_EXTRAS_SE_MAX = _short_extras_se
+SHORT_FAIL_FAST_WINDOW = _env_int("SHORT_FAIL_FAST_WINDOW", SHORT_FAIL_FAST_WINDOW)
+SHORT_FAIL_FAST_MAX_CORRECT = _env_int(
+    "SHORT_FAIL_FAST_MAX_CORRECT", SHORT_FAIL_FAST_MAX_CORRECT
+)
+
+LONG_EARLY_STOP_ENABLE = _env_bool("LONG_EARLY_STOP_ENABLE", LONG_EARLY_STOP_ENABLE)
+LONG_EARLY_STOP_AFTER = _env_int("LONG_EARLY_STOP_AFTER", LONG_EARLY_STOP_AFTER)
+LONG_FAIL_FAST_WINDOW = _env_int("LONG_FAIL_FAST_WINDOW", LONG_FAIL_FAST_WINDOW)
+LONG_FAIL_FAST_MAX_CORRECT = _env_int(
+    "LONG_FAIL_FAST_MAX_CORRECT", LONG_FAIL_FAST_MAX_CORRECT
+)
+_long_min_info_gain = _env_float("LONG_MIN_INFO_GAIN", LONG_MIN_INFO_GAIN)
+if _long_min_info_gain is not None:
+    LONG_MIN_INFO_GAIN = _long_min_info_gain
 
 
 def god_thresholds(cfg: object | None = None) -> dict[str, float | int]:
@@ -197,6 +265,8 @@ def god_thresholds(cfg: object | None = None) -> dict[str, float | int]:
         min_open = _value("TEST_GOD_MIN_OPEN")
         rubric0 = _value("TEST_GOD_RUBRIC0")
         rubric1 = _value("TEST_GOD_RUBRIC1")
+        rubric_primary = _value("TEST_GOD_MIN_OPEN_RUBRIC")
+        rubric_secondary = _value("TEST_GOD_MIN_OPEN_RUBRIC_SEC")
 
         if min_norm is not None:
             thresholds["min_norm"] = float(min_norm)
@@ -212,6 +282,10 @@ def god_thresholds(cfg: object | None = None) -> dict[str, float | int]:
             thresholds["rubric0"] = float(rubric0)
         if rubric1 is not None:
             thresholds["rubric1"] = float(rubric1)
+        if rubric_primary is not None:
+            thresholds["rubric0"] = float(rubric_primary)
+        if rubric_secondary is not None:
+            thresholds["rubric1"] = float(rubric_secondary)
 
         test_min_open = min_open
         test_min_l2_seen = min_l2_seen
