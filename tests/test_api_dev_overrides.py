@@ -1,5 +1,7 @@
 import os
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from tests.test_api_flows import _reload_app
@@ -22,8 +24,17 @@ def test_dev_run_god_overrides(tmp_path):
         assert all(tier != "GOD" for tier in tiers)
         reasons = prod_payload.get("reasons", {})
         assert isinstance(reasons, dict)
+        allowed = {
+            "norm_low",
+            "se_high",
+            "open_count_low",
+            "open_rubric_low",
+            "open_blocked_progress",
+            "open_blocked_fail_fast",
+            "no_items",
+        }
         for dom, flags in reasons.items():
-            assert set(flags or []) & {"norm_low", "se_high", "open_count_low", "open_rubric_low"}, dom
+            assert set(flags or []) & allowed, dom
 
         staging = client.get(
             "/dev/run",
@@ -53,6 +64,56 @@ def test_dev_run_god_overrides(tmp_path):
             assert "open_count_low" not in (flags or [])
             assert "open_rubric_low" not in (flags or [])
 
+        staging_god = client.get(
+            "/dev/run",
+            params={
+                "run": "long",
+                "mode": "god",
+                "seed": 11,
+                "TEST_MODE": 1,
+                "TEST_GOD_MIN_NORM": 9.4,
+                "TEST_GOD_MAX_SE": 0.60,
+                "TEST_GOD_MIN_L2_SEEN": 12,
+                "TEST_GOD_MIN_L2_ACC": 0.80,
+                "TEST_GOD_MIN_OPEN": 2,
+                "TEST_GOD_MIN_OPEN_RUBRIC": 0.1,
+                "TEST_GOD_MIN_OPEN_RUBRIC_SEC": 0.05,
+                "TEST_OPEN_FULL": 1,
+            },
+        )
+        assert staging_god.status_code == 200
+        staging_god_payload = staging_god.json()
+        assert staging_god_payload.get("tiers")
+        assert all(tier == "GOD" for tier in staging_god_payload["tiers"])
+        assert staging_god_payload.get("open_used") == 16
+        for flags in staging_god_payload.get("reasons", {}).values():
+            assert "open_rubric_low" not in (flags or [])
+        debug_meta = staging_god_payload.get("debug") or {}
+        thresholds = debug_meta.get("god_thresholds") or {}
+        assert pytest.approx(0.1, rel=0.0, abs=1e-6) == thresholds.get("rubric0")
+        assert pytest.approx(0.05, rel=0.0, abs=1e-6) == thresholds.get("rubric1")
+
+        staging_god_fail = client.get(
+            "/dev/run",
+            params={
+                "run": "long",
+                "mode": "fail",
+                "seed": 11,
+                "TEST_MODE": 1,
+                "TEST_GOD_MIN_NORM": 9.4,
+                "TEST_GOD_MAX_SE": 0.60,
+                "TEST_GOD_MIN_L2_SEEN": 12,
+                "TEST_GOD_MIN_L2_ACC": 0.80,
+                "TEST_GOD_MIN_OPEN": 2,
+                "TEST_GOD_MIN_OPEN_RUBRIC": 0.1,
+                "TEST_GOD_MIN_OPEN_RUBRIC_SEC": 0.05,
+            },
+        )
+        assert staging_god_fail.status_code == 200
+        staging_god_fail_payload = staging_god_fail.json()
+        assert staging_god_fail_payload.get("open_used") == 0
+        assert staging_god_fail_payload.get("stop_reason") == "fail_fast_long"
+
         realistic = client.get(
             "/dev/run",
             params={
@@ -67,6 +128,8 @@ def test_dev_run_god_overrides(tmp_path):
                 "TEST_GOD_MIN_OPEN": 16,
                 "TEST_GOD_RUBRIC0": 0.70,
                 "TEST_GOD_RUBRIC1": 0.65,
+                "TEST_GOD_MIN_OPEN_RUBRIC": 0.70,
+                "TEST_GOD_MIN_OPEN_RUBRIC_SEC": 0.65,
                 "TEST_OPEN_FULL": 1,
             },
         )
@@ -92,6 +155,8 @@ def test_dev_run_god_overrides(tmp_path):
                 "TEST_GOD_MIN_OPEN": 16,
                 "TEST_GOD_RUBRIC0": 0.95,
                 "TEST_GOD_RUBRIC1": 0.90,
+                "TEST_GOD_MIN_OPEN_RUBRIC": 0.95,
+                "TEST_GOD_MIN_OPEN_RUBRIC_SEC": 0.90,
                 "TEST_OPEN_FULL": 1,
             },
         )
@@ -170,6 +235,8 @@ def test_dev_run_god_overrides(tmp_path):
             "TEST_GOD_MIN_OPEN",
             "TEST_GOD_RUBRIC0",
             "TEST_GOD_RUBRIC1",
+            "TEST_GOD_MIN_OPEN_RUBRIC",
+            "TEST_GOD_MIN_OPEN_RUBRIC_SEC",
             "TEST_OPEN_FULL",
         ]:
             os.environ.pop(key, None)

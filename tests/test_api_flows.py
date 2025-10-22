@@ -1,10 +1,11 @@
 import importlib
 import os
 import sys
+from typing import Callable
 
 from fastapi.testclient import TestClient
 
-from skill_core.config import GLOBAL_STEP_CAP
+from skill_core.config import GLOBAL_STEP_CAP, CAP_SHORT, CAP_LONG
 
 _MODULES = [
     "skill_core.config",
@@ -29,8 +30,37 @@ def _reload_app(tmp_path):
     return storage, app_module
 
 
-def _answer_value(item):
+def _answer_value(item, session=None):
     itype = item.get("type")
+    if session is not None:
+        obj = getattr(session, "_id_to_item", {}).get(item.get("id"))
+        if obj is not None:
+            t = str(getattr(obj, "type", itype or "")).upper()
+            if t == "MCQ":
+                correct = getattr(obj, "correct", None)
+                if isinstance(correct, int):
+                    return correct
+            if t == "SJT":
+                keys = getattr(obj, "keys", None) or getattr(obj, "sjt_keys", None)
+                if isinstance(keys, dict) and keys:
+                    try:
+                        return int(max(
+                            ((int(k), float(v)) for k, v in keys.items()),
+                            key=lambda kv: kv[1],
+                        )[0])
+                    except Exception:
+                        pass
+                for field in ("best_index", "best", "key_best"):
+                    val = getattr(obj, field, None)
+                    if isinstance(val, int):
+                        return int(val)
+            if t == "SR":
+                return 4
+            if t == "OPEN":
+                return (
+                    "Deliver a 3-step plan with 90% accuracy metric, weekly review cadence, validation baseline, "
+                    "and a go/no-go decision gate."
+                )
     if itype == "OPEN":
         return (
             "Deliver a 3-step plan with 90% accuracy metric, weekly review cadence, validation baseline, "
@@ -56,6 +86,53 @@ def _answer_value(item):
                 return int(item[field])
         return 1
     return 3
+
+
+def _wrong_answer_value(item, session=None):
+    itype = item.get("type")
+    if itype in {"MCQ", "SJT"}:
+        return -1
+    if itype == "OPEN":
+        return "Declining to provide details."
+    return 1
+
+
+def _run_session_flow(
+    client: TestClient,
+    app_module,
+    run_type: str,
+    answer_fn: Callable[[dict, object], int | str],
+):
+    start = client.post("/session/start", json={"run": run_type, "llm": "none"})
+    assert start.status_code == 200
+    sid = start.json()["session_id"]
+    session = app_module.SESS.get(sid)
+
+    steps = 0
+    while True:
+        nxt = client.get(f"/session/{sid}/next")
+        if nxt.status_code == 204:
+            break
+        assert nxt.status_code == 200
+        item = nxt.json().get("item")
+        assert item, "Expected item payload"
+
+        answer_val = answer_fn(item, session)
+        payload = {
+            "item_id": item["id"],
+            "value": answer_val,
+            "rt_ms": 2500 if item.get("type") == "OPEN" else 2000,
+        }
+        ans = client.post(f"/session/{sid}/answer", json=payload)
+        assert ans.status_code == 200
+        steps += 1
+        if ans.json().get("done"):
+            break
+        assert steps <= GLOBAL_STEP_CAP
+
+    finish = client.post("/session/finish", json={"session_id": sid})
+    assert finish.status_code == 200
+    return finish.json(), steps
 
 
 def test_short_end_to_end_ok(tmp_path):
@@ -97,7 +174,7 @@ def test_short_end_to_end_ok(tmp_path):
     summary = report.get("summary") or {}
     assert summary.get("steps_used") == steps
     cap_str = summary.get("cap", "")
-    assert cap_str.startswith(f"{steps}/")
+    assert cap_str == f"{CAP_SHORT}/{CAP_LONG}"
     assert summary.get("sr_used", 0) >= 0
     assert summary.get("open_used", 0) == 0
 def test_long_finish_requires_done(tmp_path):
@@ -146,15 +223,102 @@ def test_long_finish_requires_done(tmp_path):
     summary = report.get("summary") or {}
     assert summary.get("steps_used") == steps
     cap_str = summary.get("cap", "")
-    assert cap_str, "cap summary should be present"
-    used_str, _, limit_str = cap_str.partition("/")
-    used_val = int(used_str)
-    limit_val = int(limit_str)
-    assert used_val == summary.get("steps_used")
-    assert limit_val == GLOBAL_STEP_CAP
+    assert cap_str == f"{CAP_LONG}/{CAP_LONG}", cap_str
+    used_val = summary.get("steps_used")
+    limit_val = CAP_LONG
     assert summary.get("sr_used") == 16
-    assert summary.get("open_used") >= 8
+    stop_reason = summary.get("stop_reason")
+    if stop_reason == "fail_fast_long":
+        assert summary.get("open_used", 0) == 0
+    else:
+        assert summary.get("open_used", 0) >= 8
     assert used_val <= GLOBAL_STEP_CAP
+
+
+def test_finish_summary_stop_reasons_and_fail_fast_windows(tmp_path):
+    os.environ["STAGING_PROFILE"] = "1"
+    try:
+        pass_overrides = {
+            "LONG_EARLY_STOP_ENABLE": "0",
+            "SHORT_FAIL_FAST_MAX_CORRECT": "-1",
+            "LONG_FAIL_FAST_MAX_CORRECT": "-1",
+            "SHORT_EXTRAS_REQUIRE_PROGRESS": "0",
+            "SHORT_EXTRAS_SE_MAX": "1.0",
+            "TEST_MODE": "1",
+        }
+        for key, value in pass_overrides.items():
+            os.environ[key] = value
+
+        _, app_module = _reload_app(tmp_path)
+        client_pass = TestClient(app_module.app)
+
+        short_pass_report, short_pass_steps = _run_session_flow(client_pass, app_module, "short", _answer_value)
+        long_pass_report, long_pass_steps = _run_session_flow(client_pass, app_module, "long", _answer_value)
+
+        for key in pass_overrides:
+            os.environ.pop(key, None)
+
+        os.environ["LONG_EARLY_STOP_ENABLE"] = "1"
+        _, app_module = _reload_app(tmp_path)
+        client_fail = TestClient(app_module.app)
+
+        short_fail_report, short_fail_steps = _run_session_flow(client_fail, app_module, "short", _wrong_answer_value)
+        long_fail_report, long_fail_steps = _run_session_flow(client_fail, app_module, "long", _wrong_answer_value)
+
+        def _summary(report):
+            return report.get("summary") or {}
+
+        short_pass_summary = _summary(short_pass_report)
+        assert short_pass_summary.get("stop_reason") in (None, "")
+        assert short_pass_summary.get("steps_used") == short_pass_steps == 40
+        assert short_pass_summary.get("sr_used") == 8
+        assert short_pass_summary.get("open_used") == 0
+        assert short_pass_summary.get("cap") == f"{CAP_SHORT}/{CAP_LONG}"
+        assert short_pass_summary.get("effective_steps") == short_pass_steps
+        assert short_pass_summary.get("ff_win_obj_len_short") == 12
+        assert short_pass_summary.get("ff_win_obj_len_long") == 20
+
+        short_fail_summary = _summary(short_fail_report)
+        assert short_fail_summary.get("stop_reason") == "fail_fast_short"
+        assert short_fail_summary.get("steps_used") == short_fail_steps
+        assert short_fail_summary.get("steps_used") < 40
+        assert short_fail_summary.get("sr_used") == 8
+        assert short_fail_summary.get("open_used") == 0
+        assert short_fail_summary.get("cap") == f"{CAP_SHORT}/{CAP_LONG}"
+        assert short_fail_summary.get("effective_steps") == short_fail_steps
+        assert short_fail_summary.get("ff_win_obj_len_short") == 12
+        assert short_fail_summary.get("ff_win_obj_len_long") == 20
+
+        long_pass_summary = _summary(long_pass_report)
+        assert long_pass_summary.get("stop_reason") in (None, "")
+        assert long_pass_summary.get("steps_used") == long_pass_steps == 160
+        assert long_pass_summary.get("sr_used") == 16
+        assert long_pass_summary.get("open_used") == 7
+        assert long_pass_summary.get("cap") == f"{CAP_LONG}/{CAP_LONG}"
+        assert long_pass_summary.get("effective_steps") == CAP_LONG
+        assert long_pass_summary.get("effective_steps") == long_pass_summary.get(
+            "steps_used"
+        )
+        assert long_pass_summary.get("ff_win_obj_len_short") == 12
+        assert long_pass_summary.get("ff_win_obj_len_long") == 20
+
+        long_fail_summary = _summary(long_fail_report)
+        assert long_fail_summary.get("stop_reason") == "fail_fast_long"
+        assert long_fail_summary.get("steps_used") == long_fail_steps
+        assert long_fail_summary.get("steps_used") < 160
+        assert long_fail_summary.get("sr_used") == 16
+        assert long_fail_summary.get("open_used") == 0
+        assert long_fail_summary.get("cap") == f"{CAP_LONG}/{CAP_LONG}"
+        assert long_fail_summary.get("effective_steps") == long_fail_steps
+        assert long_fail_summary.get("effective_steps") == long_fail_summary.get(
+            "steps_used"
+        )
+        assert long_fail_summary.get("ff_win_obj_len_short") == 12
+        assert long_fail_summary.get("ff_win_obj_len_long") == 20
+    finally:
+        for key in ("STAGING_PROFILE", "LONG_EARLY_STOP_ENABLE"):
+            os.environ.pop(key, None)
+        _reload_app(tmp_path)
 
 
 def test_dev_run_modes(tmp_path):
@@ -176,11 +340,16 @@ def test_dev_run_modes(tmp_path):
         assert str(long_payload.get("cap", "")).endswith("/160")
         assert long_payload.get("sr_used") == 16
         assert int(long_payload.get("open_used", 0)) >= 8
+        assert long_payload.get("effective_steps") == 160
+        assert long_payload.get("effective_steps") == long_payload.get("steps")
 
         long_fail = client.get("/dev/run", params={"run": "long", "mode": "fail", "seed": 11})
         assert long_fail.status_code == 200
         fail_payload = long_fail.json()
         assert int(fail_payload.get("open_used", 0)) <= 8
+        assert fail_payload.get("effective_steps", 0) <= 160
+        if "steps" in fail_payload:
+            assert fail_payload.get("effective_steps") == fail_payload.get("steps")
     finally:
         os.environ.pop("STAGING_PROFILE", None)
         _reload_app(tmp_path)

@@ -30,7 +30,13 @@ _load_azure_from_json()
 from skill_core.engine import AdaptiveSession
 from skill_core.types import Answer
 from skill_core.plan import generate_plan
-from skill_core.config import load_config, AUDIT_EXPORT_ENABLED, GLOBAL_STEP_CAP
+from skill_core.config import (
+    load_config,
+    AUDIT_EXPORT_ENABLED,
+    GLOBAL_STEP_CAP,
+    CAP_SHORT,
+    CAP_LONG,
+)
 from skill_core.audit_export import to_json as audit_to_json, to_csv as audit_to_csv
 from .storage import (
     active_sessions_for_user,
@@ -141,6 +147,98 @@ def _decorate_report(
     return report
 
 
+def _merge_session_summary(sess: AdaptiveSession, summary: dict[str, t.Any]) -> dict[str, t.Any]:
+    def _coerce_int(value: t.Any, fallback: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(fallback)
+
+    run_type = str(getattr(sess, "run_type", "short")).lower()
+    cap_limit = CAP_LONG if run_type == "long" else CAP_SHORT
+    steps_used = _coerce_int(summary.get("steps_used"), sess.steps)
+    sr_used = _coerce_int(summary.get("sr_used"), sess.sr_used)
+    open_used = _coerce_int(summary.get("open_used"), sess.open_used)
+    effective_steps = _coerce_int(
+        summary.get("effective_steps"),
+        getattr(sess, "effective_steps", steps_used),
+    )
+    extra_steps_exempt = _coerce_int(
+        summary.get("extra_steps_exempt"), getattr(sess, "extra_steps_exempt", 0)
+    )
+
+    summary["steps_used"] = steps_used
+    summary["sr_used"] = sr_used
+    summary["open_used"] = open_used
+    summary["stop_reason"] = sess.stop_reason or summary.get("stop_reason")
+    summary["effective_steps"] = effective_steps
+    summary["steps"] = sess.steps
+    summary["extra_steps_exempt"] = extra_steps_exempt
+    if "open_first_tier" not in summary:
+        summary["open_first_tier"] = dict(getattr(sess, "open_first_tier", {}) or {})
+    if "first_open_was_below_ss" not in summary:
+        summary["first_open_was_below_ss"] = dict(
+            getattr(sess, "first_open_was_below_ss", {}) or {}
+        )
+    if run_type == "long":
+        summary["cap"] = f"{CAP_LONG}/{CAP_LONG}"
+    else:
+        summary["cap"] = f"{CAP_SHORT}/{CAP_LONG}"
+    summary["cap_limit"] = cap_limit
+
+    if "god_probe_enabled" not in summary:
+        summary["god_probe_enabled"] = bool(
+            getattr(sess, "god_probe_enabled", False)
+        )
+    else:
+        summary["god_probe_enabled"] = bool(summary.get("god_probe_enabled"))
+
+    if "god_probe" not in summary:
+        try:
+            session_summary = sess.summary()
+        except Exception:
+            session_summary = {}
+        summary["god_probe"] = session_summary.get("god_probe")
+        if not summary["god_probe"]:
+            domains_map = getattr(getattr(sess, "state", None), "domains", {}) or {}
+            summary["god_probe"] = {}
+            for domain in domains_map.keys():
+                reasons = list(
+                    getattr(sess, "god_probe_reasons", {}).get(domain, [])
+                )
+                summary["god_probe"][domain] = {
+                    "first_rubric": getattr(
+                        sess, "first_open_rubric", {}
+                    ).get(domain),
+                    "first_difficulty": getattr(
+                        sess, "first_open_difficulty", {}
+                    ).get(domain),
+                    "open_first_tier": getattr(
+                        sess, "open_first_tier", {}
+                    ).get(domain),
+                    "first_open_was_below_ss": bool(
+                        getattr(sess, "first_open_was_below_ss", {})
+                        .get(domain, False)
+                    ),
+                    "probe2_rubric": getattr(sess, "god_probe_rubric", {}).get(domain),
+                    "probe2_served": bool(
+                        getattr(sess, "god_probe_used", {}).get(domain)
+                    ),
+                    "passed": getattr(sess, "god_probe_passed", {}).get(domain),
+                    "pending": bool(
+                        getattr(sess, "god_probe_pending", {}).get(domain)
+                    ),
+                    "reasons": reasons,
+                    "probe_reason": reasons[-1] if reasons else None,
+                }
+
+    if os.getenv("STAGING_PROFILE"):
+        summary["ff_win_obj_len_short"] = sess.ff_win_obj_len_short
+        summary["ff_win_obj_len_long"] = sess.ff_win_obj_len_long
+
+    return summary
+
+
 def _serialize_item(it):
     if it is None: return None
     return {
@@ -249,13 +347,7 @@ def finish(req: FEFinish):
         return JSONResponse({"status": "continue", "steps": sess.steps}, status_code=409)
     info = SESSION_INFO.get(req.session_id, {})
     result = _serialize_result(sess.finalize())
-    snapshot = sess.summary()
-    summary = dict(result.get("summary") or {})
-    summary["steps_used"] = snapshot.get("steps_used", sess.steps)
-    summary["sr_used"] = snapshot.get("sr_used", 0)
-    summary["open_used"] = snapshot.get("open_used", 0)
-    summary["cap"] = f"{summary['steps_used']}/{GLOBAL_STEP_CAP}"
-    summary.setdefault("cap_limit", snapshot.get("cap_limit"))
+    summary = _merge_session_summary(sess, dict(result.get("summary") or {}))
     result["summary"] = summary
     report = _decorate_report(
         result,
@@ -351,6 +443,7 @@ def test_finish(payload: FEFinish):
     if not sess: raise HTTPException(404, "session not found")
     info = SESSION_INFO.get(payload.session_id, {})
     res = _serialize_result(sess.finalize())
+    res["summary"] = _merge_session_summary(sess, dict(res.get("summary") or {}))
     report = _decorate_report(
         res,
         session_id=payload.session_id,
