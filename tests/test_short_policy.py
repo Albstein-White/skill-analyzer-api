@@ -10,6 +10,7 @@ from skill_core.config import (
     SHORT_SR_PER_DOMAIN,
     SHORT_LEVELS,
     SHORT_START_LEVEL,
+    SHORT_FAIL_FAST_WINDOW,
     TIER_NAMES,
 )
 from skill_core.question_bank import DOMAINS
@@ -112,6 +113,7 @@ def test_extra_allocation(monkeypatch):
         mirrored_domains_planned=set(),
         last_domain_id=None,
         last_item_type="MCQ",
+        rolling_correct_short=SHORT_FAIL_FAST_WINDOW,
     )
 
     extras_taken = {dom: 0 for dom in DOMAINS}
