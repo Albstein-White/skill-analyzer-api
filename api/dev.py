@@ -6,7 +6,7 @@ import os
 import random
 from typing import Any, Dict, Iterable, Optional, Sequence
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, FastAPI, HTTPException, Query
 
 import skill_core.engine as engine_mod
 from skill_core.scoring import score_item
@@ -16,6 +16,11 @@ import skill_core.policy as policy_mod
 from skill_core.engine import AdaptiveSession
 
 router = APIRouter()
+
+# Standalone FastAPI application for developer utilities. This allows
+# `from api.dev import app` to work in diagnostics without depending on the
+# staging-only wiring inside `api.app`.
+app = FastAPI(title="skill-analyzer-dev")
 
 
 def _open_pass_response() -> str:
@@ -676,3 +681,8 @@ def _main() -> None:
 
 if __name__ == "__main__":  # pragma: no cover - CLI helper
     _main()
+
+
+# Include router definitions after they have been declared so that the
+# standalone FastAPI instance exposes identical routes to the staging wiring.
+app.include_router(router)
