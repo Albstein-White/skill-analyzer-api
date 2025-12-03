@@ -29,6 +29,7 @@ def export_report_html(result: Dict[str, Any], path: str) -> None:
     steps_used = summ.get("steps_used")
     sr_used = summ.get("sr_used")
     open_used = summ.get("open_used")
+    stop_reason = str(summ.get("stop_reason") or "").strip()
     summary_bits: List[str] = []
     if cap_txt:
         summary_bits.append(f"steps {cap_txt}")
@@ -36,6 +37,8 @@ def export_report_html(result: Dict[str, Any], path: str) -> None:
         summary_bits.append(f"SR used {int(sr_used)}")
     if isinstance(open_used, (int, float)):
         summary_bits.append(f"OPEN used {int(open_used)}")
+    if stop_reason:
+        summary_bits.append(f"stop reason: {stop_reason}")
     if summary_bits:
         run_summary_html = f"<p><b>Run summary:</b> {' · '.join(summary_bits)}</p>"
 
