@@ -12,8 +12,8 @@ from .config import (
     SE_TARGET_LONG,
     SHORT_OBJ_MIN,
     SHORT_OBJ_MAX,
-    OBJ_MIN_LONG,
-    OBJ_MAX_LONG,
+    LONG_OBJ_MIN,
+    LONG_OBJ_MAX,
     LEVEL_MIN,
     LEVEL_MAX,
     CAP_SHORT,
@@ -31,6 +31,10 @@ from .config import (
     OPEN_DEBUG_REASON,
     SHORT_SR_PER_DOMAIN,
     SHORT_EXTRA_TOTAL,
+    SHORT_EXTRAS_REQUIRE_PROGRESS,
+    SHORT_EXTRAS_SE_MAX,
+    SHORT_FAIL_FAST_WINDOW,
+    SHORT_FAIL_FAST_MAX_CORRECT,
     SR_PER_DOMAIN_LONG,
     SHORT_LEVELS,
     SHORT_START_LEVEL,
@@ -39,6 +43,16 @@ from .config import (
     TEST_OPEN_FULL,
     OPEN_RESERVE_FORCE,
     DEBUG_SEED,
+    PROD_GOD_ENABLE,
+    GOD_PROBE_MIN_FIRST,
+    GOD_PROBE_MIN_SECOND,
+    GOD_PROBE_DIFFICULTY,
+    GOD_PROBE_EXEMPT_FROM_CAP,
+    PROD_GOD_RUBRIC0,
+    PROD_GOD_RUBRIC1,
+    OPEN_MIN_TIER,
+    TIER_NAMES,
+    LONG_MIN_OBJ_FOR_FIRST_OPEN,
 )
 
 
@@ -75,9 +89,36 @@ class PolicyState:
     step: int
     hist: Dict[str, DomainHistory]
     info_history: List[float]
+    tiers: Dict[str, str] = field(default_factory=dict)
     mirrored_domains_planned: Set[str] = field(default_factory=set)
     last_domain_id: Optional[str] = None
     last_item_type: Optional[str] = None
+    rolling_correct_short: int = 0
+    rolling_correct_long: int = 0
+    median_info_long: float = 0.0
+    rolling_info_long: float = 0.0
+    fail_fast_long_active: bool = False
+    ff_len_short: int = 0
+    ff_len_long: int = 0
+    sr_done: bool = False
+    first_open_rubric: Dict[str, Optional[float]] = field(default_factory=dict)
+    first_open_difficulty: Dict[str, Optional[float]] = field(default_factory=dict)
+    first_open_tier: Dict[str, Optional[str]] = field(default_factory=dict)
+    first_open_was_below_ss: Dict[str, bool] = field(default_factory=dict)
+    open_floor_applied: Dict[str, bool] = field(default_factory=dict)
+    god_probe_pending: Dict[str, bool] = field(default_factory=dict)
+    god_probe_used: Dict[str, bool] = field(default_factory=dict)
+    god_probe_passed: Dict[str, Optional[bool]] = field(default_factory=dict)
+    god_probe_rubric: Dict[str, Optional[float]] = field(default_factory=dict)
+    god_probe_reasons: Dict[str, List[str]] = field(default_factory=dict)
+    ss_gate_status: Dict[str, bool] = field(default_factory=dict)
+    run_is_long: bool = False
+    god_probe_enabled: bool = False
+    effective_step: int = 0
+    extra_steps_exempt: int = 0
+
+    def ss_gates_met(self, domain: str) -> bool:
+        return bool(self.ss_gate_status.get(domain))
 
 
 class QuestionPolicy:
@@ -91,6 +132,7 @@ class QuestionPolicy:
         if seed is None:
             seed = random.randint(0, 2**31 - 1)
         self.rng = random.Random(int(seed))
+        self._stop_reason: Optional[str] = None
 
         levels = range(LEVEL_MIN, LEVEL_MAX + 1)
         self._obj_index: Dict[str, Dict[int, List]] = {
@@ -105,8 +147,9 @@ class QuestionPolicy:
         self._short_min = self._short_levels[0] if self._short_levels else -1
         self._short_max = self._short_levels[-1] if self._short_levels else 1
         self._last_pick_was_sr = False
-        self._open_debug: Dict[str, Optional[str]] = {d: None for d in DOMAINS}
+        self._open_debug: Dict[str, Set[str]] = {d: set() for d in DOMAINS}
         self._short_extra_domains: Optional[List[str]] = None
+        self._open_floor_pending: Dict[str, bool] = {d: False for d in DOMAINS}
 
         for it in items:
             domain = getattr(it, "domain", None)
@@ -128,7 +171,25 @@ class QuestionPolicy:
     def _bounds(run_type: str) -> tuple[float, int, int, int]:
         if run_type == "short":
             return SE_TARGET_SHORT, SHORT_OBJ_MIN, SHORT_OBJ_MAX, SHORT_SR_PER_DOMAIN
-        return SE_TARGET_LONG, OBJ_MIN_LONG, OBJ_MAX_LONG, SR_PER_DOMAIN_LONG
+        return SE_TARGET_LONG, LONG_OBJ_MIN, LONG_OBJ_MAX, SR_PER_DOMAIN_LONG
+
+    @staticmethod
+    def _tier_index(label: Optional[str]) -> int:
+        if not label:
+            return -1
+        try:
+            return TIER_NAMES.index(label)
+        except ValueError:
+            return -1
+
+    def _tier_allows_open(self, st: PolicyState, domain: str) -> bool:
+        if st.run_type != "long":
+            return False
+        current = st.tiers.get(domain)
+        if current is None:
+            return False
+        min_idx = self._tier_index(OPEN_MIN_TIER)
+        return self._tier_index(current) >= min_idx
 
     @staticmethod
     def _cap_for(run_type: str) -> int:
@@ -143,11 +204,27 @@ class QuestionPolicy:
         ):
             return False
 
+        sr_done = True
         if SHORT_SR_PER_DOMAIN > 0:
             for dom in DOMAINS:
                 hist = st.hist.get(dom, DomainHistory())
                 if hist.sr_count < SHORT_SR_PER_DOMAIN and self._sr_available(dom, st):
                     return False
+            sr_done = all(
+                st.hist.get(dom, DomainHistory()).sr_count >= SHORT_SR_PER_DOMAIN
+                for dom in DOMAINS
+            )
+
+        if not sr_done:
+            return False
+
+        if (
+            SHORT_FAIL_FAST_WINDOW > 0
+            and st.ff_len_short >= SHORT_FAIL_FAST_WINDOW
+            and st.rolling_correct_short <= SHORT_FAIL_FAST_MAX_CORRECT
+        ):
+            self._stop_reason = "fail_fast_short"
+            return True
 
         extras_total = sum(
             max(0, st.hist.get(dom, DomainHistory()).obj_count - SHORT_OBJ_MIN)
@@ -163,19 +240,170 @@ class QuestionPolicy:
                 continue
             if max(0, hist.obj_count - SHORT_OBJ_MIN) >= 2:
                 continue
+            if (
+                SHORT_EXTRAS_REQUIRE_PROGRESS
+                and st.se.get(dom, 1.0) > SHORT_EXTRAS_SE_MAX
+                and st.ff_len_short >= SHORT_FAIL_FAST_WINDOW
+                and st.rolling_correct_short <= SHORT_FAIL_FAST_MAX_CORRECT
+            ):
+                continue
             if self._objective_available(dom, st):
                 return False
 
+        if (
+            SHORT_EXTRAS_REQUIRE_PROGRESS
+            and st.ff_len_short >= SHORT_FAIL_FAST_WINDOW
+            and st.rolling_correct_short <= SHORT_FAIL_FAST_MAX_CORRECT
+        ):
+            self._stop_reason = self._stop_reason or "short_extras_gate"
+
         return True
 
+    def _long_open_block_flags(
+        self, st: PolicyState, sr_needed: int, *, force_open: bool = False
+    ) -> tuple[bool, bool]:
+        if st.run_type != "long" or force_open:
+            return (False, False)
+
+        for dom in DOMAINS:
+            hist = st.hist.get(dom, DomainHistory())
+            if hist and hist.open_count > 0:
+                self._open_floor_pending[dom] = False
+
+        floor_ready: List[str] = []
+        for dom in DOMAINS:
+            hist = st.hist.get(dom, DomainHistory())
+            if not hist:
+                continue
+            if hist.open_count == 0 and hist.obj_count >= LONG_MIN_OBJ_FOR_FIRST_OPEN:
+                floor_ready.append(dom)
+
+        for dom in floor_ready:
+            self._open_floor_pending[dom] = True
+
+        progress_block = False
+        fail_fast_block = False
+        if not st.sr_done:
+            progress_block = True
+        if not any(self._tier_allows_open(st, dom) for dom in DOMAINS):
+            progress_block = True
+
+        if progress_block and not floor_ready:
+            for dom in DOMAINS:
+                self._record_probe_reason(st, dom, "blocked_progress")
+        elif progress_block:
+            progress_block = False
+
+        return (progress_block, fail_fast_block)
+
+    @staticmethod
+    def _record_probe_reason(st: PolicyState, domain: str, reason: str) -> None:
+        if not reason:
+            return
+        reasons = st.god_probe_reasons.setdefault(domain, [])
+        if reason not in reasons:
+            reasons.append(reason)
+
+    def _should_queue_god_probe(self, st: PolicyState, domain: str) -> bool:
+        if not (st.god_probe_enabled and st.run_is_long):
+            return False
+        if st.god_probe_used.get(domain):
+            return False
+        if st.god_probe_pending.get(domain):
+            return True
+        if st.first_open_was_below_ss.get(domain):
+            first_r = st.first_open_rubric.get(domain)
+            if first_r is not None and first_r >= PROD_GOD_RUBRIC0:
+                self._record_probe_reason(st, domain, "probe_blocked_below_ss")
+            return False
+        if not st.ss_gates_met(domain):
+            if st.first_open_rubric.get(domain) is not None:
+                self._record_probe_reason(st, domain, "blocked_progress")
+            return False
+        first_r = st.first_open_rubric.get(domain)
+        if first_r is None:
+            return False
+        if first_r < PROD_GOD_RUBRIC0:
+            self._record_probe_reason(st, domain, "blocked_progress")
+            return False
+        first_diff = st.first_open_difficulty.get(domain)
+        if first_diff is None:
+            return False
+        if first_diff < 0:
+            self._record_probe_reason(st, domain, "blocked_progress")
+            return False
+        return True
+
+    def _god_probe_target_level(self) -> int:
+        if not self._open_levels:
+            return 0
+        preferred = float(GOD_PROBE_DIFFICULTY)
+        best_level = self._open_levels[0]
+        best_rank = (2, abs(float(best_level) - preferred))
+        for lvl in self._open_levels:
+            diff = float(lvl) - preferred
+            if math.isclose(diff, 0.0, abs_tol=1e-9):
+                rank = (0, 0.0)
+            elif diff > 0:
+                rank = (1, diff)
+            else:
+                rank = (2, abs(diff))
+            if rank < best_rank:
+                best_rank = rank
+                best_level = lvl
+        return int(best_level)
+
+    def _serve_god_probe(
+        self, st: PolicyState, domain: str, *, force_open: bool
+    ) -> Optional[object]:
+        st.god_probe_pending[domain] = False
+        if st.god_probe_used.get(domain):
+            return None
+        target_level = self._god_probe_target_level()
+        item, served_level = self._select_open_item(
+            domain,
+            target_level,
+            st,
+            allow_variant_reuse=True,
+        )
+        if item is None:
+            st.god_probe_used[domain] = True
+            st.god_probe_passed[domain] = False
+            if STAGING_PROFILE:
+                self._open_debug[domain].add("god_probe_no_item")
+            self._record_probe_reason(st, domain, "blocked_progress")
+            return None
+        if served_level is None:
+            served_level = target_level
+        setattr(item, "_open_target_level", target_level)
+        setattr(item, "_open_served_level", served_level)
+        meta = getattr(item, "meta", None)
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["is_god_probe"] = True
+        setattr(item, "meta", meta)
+        setattr(item, "_god_probe", True)
+        return item
+
+    def _long_open_allowed(
+        self, st: PolicyState, sr_needed: int, *, force_open: bool = False
+    ) -> bool:
+        if st.run_type != "long" or force_open:
+            return True
+        if not st.sr_done or sr_needed > 0:
+            return False
+        return any(self._tier_allows_open(st, dom) for dom in DOMAINS)
+
     def should_stop(self, st: PolicyState) -> bool:
+        self._stop_reason = None
         if st.run_type == "short":
             return self._should_stop_short(st)
 
         _, obj_min, obj_max, sr_required = self._bounds(st.run_type)
         cap = self._cap_for(st.run_type)
 
-        if st.step >= cap:
+        current_steps = st.effective_step if st.run_type == "long" else st.step
+        if current_steps >= cap:
             return True
 
         remaining_obj_minima = sum(
@@ -205,11 +433,19 @@ class QuestionPolicy:
                     return False
                 return True
 
-        if self.run_type == "long" and OPEN_ENABLED_LONG and sr_needed == 0:
-            if self._open_candidate_exists(st, obj_min):
+        if (
+            self.run_type == "long"
+            and OPEN_ENABLED_LONG
+            and sr_needed == 0
+        ):
+            if self._open_candidate_exists(st, obj_min, sr_needed):
                 return False
 
         return False
+
+    @property
+    def stop_reason(self) -> Optional[str]:
+        return self._stop_reason
 
     def next_item(self, st: PolicyState):
         if st.run_type == "short":
@@ -217,7 +453,8 @@ class QuestionPolicy:
 
         se_target, obj_min, obj_max, sr_required = self._bounds(st.run_type)
         cap = self._cap_for(st.run_type)
-        steps_left = max(cap - st.step, 0)
+        current_steps = st.effective_step if st.run_type == "long" else st.step
+        steps_left = max(cap - current_steps, 0)
         if steps_left <= 0:
             return None
 
@@ -235,6 +472,7 @@ class QuestionPolicy:
             d
             for d in DOMAINS
             if not st.hist.get(d, DomainHistory()).obj_done
+            and st.hist.get(d, DomainHistory()).obj_count < obj_max
             and st.se.get(d, 0.0) > se_target
         ]
         stage_c = [
@@ -365,15 +603,36 @@ class QuestionPolicy:
         if any(st.hist.get(d, DomainHistory()).obj_count < obj_min for d in DOMAINS):
             return []
 
-        if st.last_item_type not in ("MCQ", "SJT") and not force_open:
+        floor_pending_any = (
+            st.run_type == "long"
+            and any(self._open_floor_pending.get(dom) for dom in DOMAINS)
+        )
+
+        if (
+            st.last_item_type not in ("MCQ", "SJT")
+            and not force_open
+            and not floor_pending_any
+        ):
             return []
 
         candidates: List[Tuple[str, object, float, int, int, int]] = []
         debug_updates: Optional[Dict[str, Optional[str]]] = (
             {d: None for d in DOMAINS} if OPEN_DEBUG_REASON else None
         )
+        if st.run_type == "long":
+            for domain in DOMAINS:
+                if self._should_queue_god_probe(st, domain):
+                    st.god_probe_pending[domain] = True
         for domain in DOMAINS:
             hist = st.hist.get(domain, DomainHistory())
+            if (
+                st.run_type == "long"
+                and not force_open
+                and not self._tier_allows_open(st, domain)
+            ):
+                if debug_updates is not None:
+                    debug_updates[domain] = "tier_lt_open_min"
+                continue
             if hist.open_count >= 2:
                 if debug_updates is not None:
                     debug_updates[domain] = None
@@ -402,34 +661,49 @@ class QuestionPolicy:
                         continue
                     continue
             else:
+                floor_active = bool(self._open_floor_pending.get(domain))
+                if (
+                    st.run_type == "long"
+                    and hist.open_count == 0
+                    and hist.obj_count < LONG_MIN_OBJ_FOR_FIRST_OPEN
+                ):
+                    if debug_updates is not None:
+                        debug_updates[domain] = "obj_lt_floor"
+                    continue
                 if hist.open_count == 0:
-                    gate_ok = (
-                        hist.obj_count >= OPEN_GATE1_MIN_OBJ
-                        and se_val <= OPEN_GATE1_SE_MAX
-                    )
-                    if gate_ok:
+                    if floor_active:
                         eligible = True
                         target_level = self._pick_open_level(theta_val)
+                        reason = "floor_bypass"
                     else:
-                        if hist.obj_count < OPEN_GATE1_MIN_OBJ:
-                            reason = "obj_lt_gate1"
-                        elif se_val > OPEN_GATE1_SE_MAX:
-                            reason = "se_too_high"
-                        else:
-                            reason = "gating"
-                        fallback_used = (
-                            self.run_type == "long"
-                            and hist.obj_count >= OPEN_FALLBACK_AFTER_OBJ
-                            and getattr(hist, "b_stable", hist.level) >= OPEN_FALLBACK_MIN_STABLE
+                        gate_ok = (
+                            hist.obj_count >= OPEN_GATE1_MIN_OBJ
+                            and se_val <= OPEN_GATE1_SE_MAX
                         )
-                        if fallback_used:
+                        if gate_ok:
                             eligible = True
                             target_level = self._pick_open_level(theta_val)
-                            reason = "fallback_obj"
                         else:
-                            if debug_updates is not None:
-                                debug_updates[domain] = reason
-                            continue
+                            if hist.obj_count < OPEN_GATE1_MIN_OBJ:
+                                reason = "obj_lt_gate1"
+                            elif se_val > OPEN_GATE1_SE_MAX:
+                                reason = "se_too_high"
+                            else:
+                                reason = "gating"
+                            fallback_used = (
+                                self.run_type == "long"
+                                and hist.obj_count >= OPEN_FALLBACK_AFTER_OBJ
+                                and getattr(hist, "b_stable", hist.level)
+                                >= OPEN_FALLBACK_MIN_STABLE
+                            )
+                            if fallback_used:
+                                eligible = True
+                                target_level = self._pick_open_level(theta_val)
+                                reason = "fallback_obj"
+                            else:
+                                if debug_updates is not None:
+                                    debug_updates[domain] = reason
+                                continue
                 elif hist.open_count == 1:
                     if hist.obj_count < OPEN_GATE1_MIN_OBJ:
                         reason = "obj_lt_gate2"
@@ -510,11 +784,31 @@ class QuestionPolicy:
             )
 
         if debug_updates is not None:
-            self._open_debug.update(debug_updates)
+            for dom, reason in debug_updates.items():
+                if not reason:
+                    self._open_debug[dom].clear()
+                else:
+                    self._open_debug[dom].add(reason)
 
         return candidates
 
-    def _open_candidate_exists(self, st: PolicyState, obj_min: int) -> bool:
+    def _open_candidate_exists(
+        self, st: PolicyState, obj_min: int, sr_needed: int = 0
+    ) -> bool:
+        progress_block = False
+        fail_fast_block = False
+        if st.run_type == "long":
+            progress_block, fail_fast_block = self._long_open_block_flags(
+                st, sr_needed
+            )
+            if not self._long_open_allowed(st, sr_needed):
+                if STAGING_PROFILE:
+                    for dom in DOMAINS:
+                        if progress_block:
+                            self._open_debug[dom].add("open_blocked_progress")
+                        if fail_fast_block:
+                            self._open_debug[dom].add("open_blocked_fail_fast")
+                return False
         return bool(self._open_candidates(st, obj_min))
 
     def _maybe_serve_open(
@@ -529,10 +823,40 @@ class QuestionPolicy:
             and OPEN_RESERVE_FORCE
         )
         if sr_needed > 0 and not force_open:
-            return None
+            if not (
+                st.run_type == "long"
+                and any(self._open_floor_pending.get(dom) for dom in DOMAINS)
+            ):
+                return None
+
+        if st.run_type == "long":
+            progress_block, fail_fast_block = self._long_open_block_flags(
+                st, sr_needed, force_open=force_open
+            )
+            if not self._long_open_allowed(st, sr_needed, force_open=force_open):
+                if STAGING_PROFILE:
+                    for dom in DOMAINS:
+                        if progress_block:
+                            self._open_debug[dom].add("open_blocked_progress")
+                        if fail_fast_block:
+                            self._open_debug[dom].add("open_blocked_fail_fast")
+                return None
+            for dom in DOMAINS:
+                if st.god_probe_pending.get(dom):
+                    probe_item = self._serve_god_probe(st, dom, force_open=force_open)
+                    if probe_item is not None:
+                        return probe_item
 
         candidates = self._open_candidates(st, obj_min)
         if not candidates:
+            if st.run_type == "long":
+                for dom in DOMAINS:
+                    if self._open_floor_pending.get(dom):
+                        hist = st.hist.get(dom, DomainHistory())
+                        if hist and hist.open_count == 0:
+                            self._open_debug[dom].add("open_blocked_no_items")
+                            self._record_probe_reason(st, dom, "open_blocked_no_items")
+                        self._open_floor_pending[dom] = False
             return None
 
         def key(entry: Tuple[str, object, float, int, int, int]) -> Tuple:
@@ -553,6 +877,12 @@ class QuestionPolicy:
             served_level = target_level
         setattr(item, "_open_target_level", target_level)
         setattr(item, "_open_served_level", served_level)
+        if st.run_type == "long":
+            if self._open_floor_pending.get(domain):
+                hist = st.hist.get(domain, DomainHistory())
+                if hist and hist.open_count == 0:
+                    st.open_floor_applied[domain] = True
+                self._open_floor_pending[domain] = False
         return item
 
     def _serve_short_extra(self, st: PolicyState):
@@ -585,6 +915,13 @@ class QuestionPolicy:
                 continue
             if hist.obj_count >= SHORT_OBJ_MAX:
                 continue
+            if (
+                SHORT_EXTRAS_REQUIRE_PROGRESS
+                and st.se.get(dom, 1.0) > SHORT_EXTRAS_SE_MAX
+                and st.ff_len_short >= SHORT_FAIL_FAST_WINDOW
+                and st.rolling_correct_short <= SHORT_FAIL_FAST_MAX_CORRECT
+            ):
+                continue
             item = self._objective_item(dom, st)
             if item is not None:
                 return item
@@ -611,17 +948,23 @@ class QuestionPolicy:
             max(0, SHORT_SR_PER_DOMAIN - st.hist.get(d, DomainHistory()).sr_count)
             for d in DOMAINS
         )
-        sr_only = sr_remaining > 0 and steps_left <= sr_remaining
+        sr_domain = None
         if sr_remaining > 0:
             sr_domain = self._sr_domain(st, SHORT_OBJ_MIN, SHORT_SR_PER_DOMAIN)
-            if sr_domain is not None and (sr_only or not self._last_pick_was_sr):
+            if sr_domain is not None:
                 item = self._pick_sr_item(sr_domain, st)
                 if item is not None:
                     setattr(item, "_target_level", None)
                     setattr(item, "_served_level", None)
                     self._last_pick_was_sr = True
                     return item
+            else:
+                sr_remaining = 0
 
+        if sr_remaining > 0:
+            return None
+
+        self._last_pick_was_sr = False
         item = self._serve_short_extra(st)
         if item is not None:
             self._last_pick_was_sr = False
@@ -640,6 +983,9 @@ class QuestionPolicy:
 
     def _objective_item(self, domain: str, st: PolicyState, *, peek: bool = False) -> Optional:
         hist = st.hist.get(domain, DomainHistory())
+        _, _, obj_max, _ = self._bounds(st.run_type)
+        if hist.obj_done or hist.obj_count >= obj_max:
+            return None
         base_level = hist.level
         if self.run_type == "short":
             base_level = max(self._short_min, min(self._short_max, base_level))
@@ -672,7 +1018,11 @@ class QuestionPolicy:
 
     def _fallback_objective(self, st: PolicyState):
         level_iter = self._short_levels if self.run_type == "short" else range(LEVEL_MIN, LEVEL_MAX + 1)
+        _, _, obj_max, _ = self._bounds(st.run_type)
         for dom in DOMAINS:
+            hist = st.hist.get(dom, DomainHistory())
+            if hist.obj_done or hist.obj_count >= obj_max:
+                continue
             for lvl in level_iter:
                 if self.run_type == "short" and (lvl < self._short_min or lvl > self._short_max):
                     continue

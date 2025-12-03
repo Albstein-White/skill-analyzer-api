@@ -4,8 +4,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from types import SimpleNamespace
 from datetime import datetime, timezone
-import random, os, json, csv, time, logging, re, math
+import random, os, json, csv, time, logging, re, math, statistics
 from pathlib import Path
+from collections import deque
 
 from .types import Item, Answer, DomainScore, HiddenSkill, Result
 from .question_bank import load_bank, DOMAINS
@@ -51,9 +52,27 @@ from .config import (
     GOD_MIN_L2_SEEN,
     GOD_MIN_L2_ACC,
     GOD_MIN_OPEN,
+    PROD_GOD_ENABLE,
+    GOD_PROBE_MIN_FIRST,
+    GOD_PROBE_MIN_SECOND,
+    GOD_PROBE_DIFFICULTY,
+    GOD_PROBE_EXEMPT_FROM_CAP,
+    PROD_GOD_RUBRIC0,
+    PROD_GOD_RUBRIC1,
     GLOBAL_STEP_CAP,
     DEBUG_TRACE,
     TRACE_FIELDS,
+    SHORT_FAIL_FAST_WINDOW,
+    LONG_OBJ_MIN,
+    LONG_OBJ_MAX,
+    LONG_EARLY_STOP_ENABLE,
+    LONG_EARLY_SE,
+    LONG_EARLY_STREAK,
+    LONG_EARLY_DELTA_MAX,
+    TEST_EARLY_STOP,
+    OPEN_MIN_TIER,
+    SHORT_SR_PER_DOMAIN,
+    SR_PER_DOMAIN_LONG,
     god_thresholds,
 )
 from .policy import QuestionPolicy, PolicyState, DomainHistory
@@ -176,6 +195,14 @@ def map_tier(norm: float, run_type: str, dstate: object) -> str:
 
     meta = {"short_cap": False}
     norm_val = float(norm)
+    run_is_long = run_type == "long"
+    if run_is_long and PROD_GOD_ENABLE:
+        god_probe_used = bool(getattr(dstate, "god_probe_used", False))
+        god_probe_passed = bool(getattr(dstate, "god_probe_passed", False))
+        meta["god_probe"] = {"used": god_probe_used, "passed": god_probe_passed}
+        if god_probe_passed:
+            setattr(dstate, "_tier_meta", meta)
+            return "GOD"
 
     items_by_level = getattr(dstate, "items_by_level", {}) or {}
     accuracy_by_level = getattr(dstate, "accuracy_by_level", {}) or {}
@@ -187,7 +214,7 @@ def map_tier(norm: float, run_type: str, dstate: object) -> str:
         except Exception:
             continue
 
-    if run_type == "long":
+    if run_is_long:
         thresholds = god_thresholds()
         se_val = float(getattr(dstate, "se", 1.0))
         b_stable = int(getattr(dstate, "b_stable", 0))
@@ -250,7 +277,11 @@ def map_tier(norm: float, run_type: str, dstate: object) -> str:
             "reasons": reasons,
         }
 
-        if ok:
+        allow_god = True
+        if PROD_GOD_ENABLE and run_is_long:
+            allow_god = bool(getattr(dstate, "god_probe_passed", False))
+
+        if ok and allow_god:
             gate_info["status"] = "pass"
             gate_info["reasons"] = reasons
             meta["god_gate"] = gate_info
@@ -339,7 +370,7 @@ def _sr_trap_failed(item: Item, answer: Answer) -> bool:
 def _run_parameters(run_type: str) -> tuple[dict, float, int, int]:
     if run_type == "short":
         return SHORT_PASS, SE_TARGET_SHORT, SHORT_OBJ_MIN, SHORT_OBJ_MAX
-    return PASS_RULE_LONG, SE_TARGET_LONG, OBJ_MIN_LONG, OBJ_MAX_LONG
+    return PASS_RULE_LONG, SE_TARGET_LONG, LONG_OBJ_MIN, LONG_OBJ_MAX
 
 
 def _apply_objective_step(
@@ -558,6 +589,12 @@ class DomainState:
     sr_trap_count: int = 0
     sr_mirror_ok: bool = True
     open_debug_reason: Optional[str] = None
+    last_obj_level: Optional[int] = None
+    long_stable_streak: int = 0
+    obj_theta_deltas: List[float] = field(default_factory=list)
+    obj_diff_history: List[int] = field(default_factory=list)
+    early_stop: bool = False
+    early_stop_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, object]:
         """JSON-friendly representation used for persistence/debugging."""
@@ -591,6 +628,12 @@ class DomainState:
             "sr_trap_count": self.sr_trap_count,
             "sr_mirror_ok": self.sr_mirror_ok,
             "open_debug_reason": self.open_debug_reason,
+            "last_obj_level": self.last_obj_level,
+            "long_stable_streak": self.long_stable_streak,
+            "obj_theta_deltas": list(self.obj_theta_deltas),
+            "obj_diff_history": list(self.obj_diff_history),
+            "early_stop": self.early_stop,
+            "early_stop_reason": self.early_stop_reason,
         }
 
 @dataclass
@@ -659,6 +702,43 @@ class AdaptiveSession:
                     self._mirror_map[it.id] = partner
                     self._mirror_map.setdefault(partner, it.id)
         self._info_hist: List[float] = []
+        self._short_ff_window = max(0, self._short_fail_fast_window())
+        self._long_ff_window = 0
+        self._ff_correct_short: deque[int] = deque(
+            maxlen=self._short_ff_window or None
+        )
+        self._ff_info_short: deque[float] = deque(
+            maxlen=self._short_ff_window or None
+        )
+        self._ff_correct_long: deque[int] = deque()
+        self._ff_info_long: deque[float] = deque()
+        self.stop_reason: Optional[str] = None
+        self.first_open_rubric: Dict[str, Optional[float]] = {d: None for d in DOMAINS}
+        self.first_open_difficulty: Dict[str, Optional[float]] = {d: None for d in DOMAINS}
+        self.open_first_tier: Dict[str, Optional[str]] = {d: None for d in DOMAINS}
+        self.first_open_was_below_ss: Dict[str, bool] = {d: False for d in DOMAINS}
+        self.open_floor_applied: Dict[str, bool] = {d: False for d in DOMAINS}
+        self.god_probe_pending: Dict[str, bool] = {d: False for d in DOMAINS}
+        self.god_probe_used: Dict[str, bool] = {d: False for d in DOMAINS}
+        self.god_probe_passed: Dict[str, Optional[bool]] = {d: None for d in DOMAINS}
+        self.god_probe_rubric: Dict[str, Optional[float]] = {d: None for d in DOMAINS}
+        self.god_probe_reasons: Dict[str, List[str]] = {d: [] for d in DOMAINS}
+        self.god_probe_enabled: bool = bool(PROD_GOD_ENABLE and run_type == "long")
+        self.extra_steps_exempt: int = 0
+
+        self.long_obj_min = max(1, int(self.cfg.get("LONG_OBJ_MIN", LONG_OBJ_MIN)))
+        self.long_obj_max = max(self.long_obj_min, int(self.cfg.get("LONG_OBJ_MAX", LONG_OBJ_MAX)))
+        self.long_early_se = float(self.cfg.get("LONG_EARLY_SE", LONG_EARLY_SE))
+        self.long_early_streak = max(1, int(self.cfg.get("LONG_EARLY_STREAK", LONG_EARLY_STREAK)))
+        self.long_early_delta_max = float(
+            self.cfg.get("LONG_EARLY_DELTA_MAX", LONG_EARLY_DELTA_MAX)
+        )
+        override = str(self.cfg.get("TEST_EARLY_STOP", TEST_EARLY_STOP) or "").strip().lower()
+        self.long_early_stop_enabled = bool(LONG_EARLY_STOP_ENABLE)
+        if override == "on":
+            self.long_early_stop_enabled = True
+        elif override == "off":
+            self.long_early_stop_enabled = False
 
         # load RT baselines if present
         self.base_rt = DEFAULT_BASE_RT
@@ -701,39 +781,190 @@ class AdaptiveSession:
                 st.b_stable = max(st.b_stable, start_level)
                 continue
 
-            base_level = 0
-            sr_mean: Optional[float] = None
-            if st.sr_total > 0:
-                sr_mean = st.sr_sum / max(1, st.sr_total)
-            elif sr_cfg:
-                raw = sr_cfg.get(domain)
-                if raw is not None:
-                    try:
-                        sr_mean = float(raw)
-                    except Exception:
-                        sr_mean = None
-
-            if sr_mean is not None:
-                base_level += _sr_shift_from_mean(sr_mean)
-            base_level = max(-1, min(1, base_level))
-
-            start_level = base_level
+            start_level = 0
             prior_val = theta_cfg.get(domain)
             if prior_val is not None:
-                start_level = int(round(prior_val))
+                try:
+                    start_level = _clamp_level(int(round(prior_val)))
+                except Exception:
+                    start_level = 0
 
-            start_level = _clamp_level(start_level)
-            st.level = start_level
+            st.level = _clamp_level(start_level)
             st.recent_window.clear()
             st.level_entry_seen = 0
-            st.b_peak = start_level
-            if prior_val is not None:
-                st.b_stable = max(st.b_stable, start_level)
+            st.b_peak = st.level
+            st.b_stable = max(st.b_stable, st.level)
+
+    def _short_fail_fast_window(self) -> int:
+        raw = self.cfg.get("SHORT_FAIL_FAST_WINDOW", SHORT_FAIL_FAST_WINDOW)
+        try:
+            return int(raw)
+        except Exception:
+            return int(SHORT_FAIL_FAST_WINDOW)
+
+    def _long_fail_fast_window(self) -> int:
+        return 0
+
+    def rolling_correct(self, window: int) -> int:
+        if window <= 0:
+            return 0
+        if self._long_ff_window > 0 and window > self._short_ff_window:
+            values = list(self._ff_correct_long)
+        else:
+            values = list(self._ff_correct_short)
+        if not values:
+            return 0
+        if window >= len(values):
+            return sum(values)
+        return sum(values[-window:])
+
+    def _rolling_correct_short(self) -> int:
+        if self._short_ff_window <= 0 or not self._ff_correct_short:
+            return 0
+        return sum(self._ff_correct_short)
+
+    def _rolling_correct_long(self) -> int:
+        if self._long_ff_window <= 0 or not self._ff_correct_long:
+            return 0
+        return sum(self._ff_correct_long)
+
+    def median_info(self, window: int) -> float:
+        if window <= 0:
+            return 0.0
+        if self._long_ff_window > 0 and window >= self._long_ff_window:
+            values = list(self._ff_info_long)
+        else:
+            values = list(self._ff_info_short)
+        if not values:
+            return 0.0
+        if window < len(values):
+            values = values[-window:]
+        try:
+            return float(statistics.median(values))
+        except statistics.StatisticsError:
+            return 0.0
+
+    def _median_info_long(self) -> float:
+        if self._long_ff_window <= 0 or not self._ff_info_long:
+            return 0.0
+        try:
+            return float(statistics.median(self._ff_info_long))
+        except statistics.StatisticsError:
+            return 0.0
+
+    def _record_fail_fast_stats(
+        self,
+        *,
+        is_objective: bool,
+        correct: bool,
+        info_gain: float,
+    ) -> None:
+        if not is_objective:
+            return
+
+        if self._short_ff_window > 0:
+            self._ff_correct_short.append(1 if correct else 0)
+            self._ff_info_short.append(float(info_gain))
+        if self._long_ff_window > 0:
+            self._ff_correct_long.append(1 if correct else 0)
+            self._ff_info_long.append(float(info_gain))
+
+    def _maybe_trigger_long_early_stop(self, domain: str, st: DomainState) -> None:
+        if self.run_type != "long":
+            return
+        if not self.long_early_stop_enabled:
+            return
+        if st.early_stop:
+            return
+        if st.obj_count < self.long_obj_min:
+            return
+        if st.long_stable_streak < self.long_early_streak:
+            return
+        if float(st.se) > float(self.long_early_se):
+            return
+        if len(st.obj_theta_deltas) < self.long_early_streak:
+            return
+        if len(st.obj_diff_history) < self.long_early_streak:
+            return
+        current_level = st.last_obj_level if st.last_obj_level is not None else st.level
+        try:
+            current_level = int(current_level)
+        except Exception:
+            current_level = st.level
+        try:
+            deltas_avg = sum(
+                abs(float(v)) for v in st.obj_theta_deltas[-self.long_early_streak :]
+            ) / float(self.long_early_streak)
+        except ZeroDivisionError:
+            deltas_avg = 0.0
+        if deltas_avg >= self.long_early_delta_max:
+            return
+        recent_diffs = st.obj_diff_history[-self.long_early_streak:]
+        if any(abs(int(diff) - int(current_level)) > 1 for diff in recent_diffs):
+            return
+        tier_label = self._current_tier_label(domain)
+        if self.policy._tier_index(tier_label) < self.policy._tier_index(OPEN_MIN_TIER):
+            return
+        if st.open_count < 1:
+            return
+        st.early_stop = True
+        st.early_stop_reason = "confident_band"
+        st.obj_done = True
+
+    def _append_god_probe_reason(self, domain: str, reason: str) -> None:
+        if not reason:
+            return
+        reasons = self.god_probe_reasons.setdefault(domain, [])
+        if reason not in reasons:
+            reasons.append(reason)
+
+    def _current_tier_label(self, domain: str) -> str:
+        if domain not in DOMAINS:
+            return "F"
+        st = self.state.domains[domain]
+        level_stats = st.level_stats if isinstance(st.level_stats, dict) else {}
+        items_by_level: Dict[int, int] = {}
+        accuracy_by_level: Dict[int, float] = {}
+        for lvl_key, stats in level_stats.items():
+            try:
+                lvl_int = int(lvl_key)
+            except Exception:
+                continue
+            seen = int(stats.get("seen", 0)) if isinstance(stats, dict) else 0
+            correct = int(stats.get("correct", 0)) if isinstance(stats, dict) else 0
+            items_by_level[lvl_int] = max(seen, 0)
+            accuracy_by_level[lvl_int] = _safe_frac(correct, seen)
+
+        open_ratings: List[float] = []
+        for entry in st.open_contrib:
+            if not isinstance(entry, dict) or entry.get("ignored"):
+                continue
+            try:
+                open_ratings.append(float(entry.get("r", 0.0) or 0.0))
+            except Exception:
+                continue
+
+        norm_ten = _theta_to_norm_score(st.theta, domain) / 10.0
+        tier_state = SimpleNamespace(
+            b_stable=st.b_stable,
+            se=st.se,
+            items_by_level=items_by_level,
+            accuracy_by_level=accuracy_by_level,
+            open_count=st.open_count,
+            open_ratings=open_ratings,
+            god_probe_used=self.god_probe_used.get(domain),
+            god_probe_passed=self.god_probe_passed.get(domain),
+            run_is_long=self.run_type == "long",
+        )
+        return map_tier(norm_ten, self.run_type, tier_state)
 
     def _policy_state(self) -> PolicyState:
         hist: Dict[str, DomainHistory] = {}
         theta_map: Dict[str, float] = {}
         se_map: Dict[str, float] = {}
+        ss_gate_status: Dict[str, bool] = {}
+        tier_map: Dict[str, str] = {}
+        thresholds = god_thresholds() if self.run_type == "long" else None
         for d in DOMAINS:
             dh = DomainHistory()
             dh.asked_ids = [iid for iid in self.asked if self._id_to_item[iid].domain == d]
@@ -756,20 +987,91 @@ class AdaptiveSession:
             dh.b_stable = st.b_stable
             dh.open_debug_reason = getattr(st, "open_debug_reason", None)
             hist[d] = dh
+            tier_map[d] = self._current_tier_label(d)
+            if thresholds:
+                level_stats = st.level_stats if isinstance(st.level_stats, dict) else {}
+                level_two = level_stats.get(2, {}) if isinstance(level_stats, dict) else {}
+                seen_l2 = 0
+                correct_l2 = 0
+                if isinstance(level_two, dict):
+                    seen_l2 = int(level_two.get("seen", 0) or 0)
+                    correct_l2 = int(level_two.get("correct", 0) or 0)
+                l2_acc = _safe_frac(correct_l2, seen_l2)
+                norm_val = _theta_to_norm_score(st.theta, d) / 10.0
+                ss_gate_status[d] = (
+                    norm_val >= float(thresholds["min_norm"])
+                    and float(st.se) <= float(thresholds["max_se"])
+                    and int(st.b_stable) >= int(GOD_REQ_LEVEL)
+                    and seen_l2 >= int(thresholds["min_l2_seen"])
+                    and l2_acc >= float(thresholds["min_l2_acc"])
+                )
+            else:
+                ss_gate_status[d] = False
+        short_window = self._short_ff_window if self._short_ff_window > 0 else 0
+        long_window = 0
+        if self.run_type == "long":
+            sr_required = SR_PER_DOMAIN_LONG
+        else:
+            sr_required = SHORT_SR_PER_DOMAIN
+        if sr_required > 0:
+            sr_done = all(
+                hist.get(dom, DomainHistory()).sr_count >= sr_required for dom in DOMAINS
+            )
+        else:
+            sr_done = True
         return PolicyState(
-            run_type=self.run_type, theta=theta_map, se=se_map, asked=set(self.asked),
-            seen_variant_groups=set(self.seen_variant_groups), step=self._step, hist=hist,
-            info_history=self._info_hist, mirrored_domains_planned=getattr(self, "_mir_planned", set()),
+            run_type=self.run_type,
+            theta=theta_map,
+            se=se_map,
+            asked=set(self.asked),
+            seen_variant_groups=set(self.seen_variant_groups),
+            step=self._step,
+            hist=hist,
+            info_history=self._info_hist,
+            mirrored_domains_planned=getattr(self, "_mir_planned", set()),
             last_domain_id=self.last_domain_id,
             last_item_type=self._last_item_type,
+            rolling_correct_short=self._rolling_correct_short() if short_window else 0,
+            rolling_correct_long=0,
+            median_info_long=0.0,
+            rolling_info_long=0.0,
+            fail_fast_long_active=False,
+            ff_len_short=self.ff_win_obj_len_short if short_window else 0,
+            ff_len_long=0,
+            sr_done=sr_done,
+            first_open_rubric=dict(self.first_open_rubric),
+            first_open_difficulty=dict(self.first_open_difficulty),
+            first_open_tier=dict(self.open_first_tier),
+            first_open_was_below_ss=dict(self.first_open_was_below_ss),
+            open_floor_applied=self.open_floor_applied,
+            god_probe_pending=self.god_probe_pending,
+            god_probe_used=self.god_probe_used,
+            god_probe_passed=self.god_probe_passed,
+            god_probe_rubric=self.god_probe_rubric,
+            god_probe_reasons=self.god_probe_reasons,
+            ss_gate_status=ss_gate_status,
+            tiers=tier_map,
+            run_is_long=self.run_type == "long",
+            god_probe_enabled=self.god_probe_enabled,
+            effective_step=self.effective_steps,
+            extra_steps_exempt=self.extra_steps_exempt,
         )
+
+    def _update_fail_fast_long_flag(self, st: PolicyState) -> None:
+        return
 
     def _update_obj_done(self, st: DomainState) -> None:
         _, se_target, obj_min, obj_max = _run_parameters(self.run_type)
-        st.obj_done = (
-            (st.obj_count >= obj_min and st.se <= se_target)
-            or st.obj_count >= obj_max
-        )
+        if self.run_type == "long":
+            obj_min = self.long_obj_min
+            obj_max = self.long_obj_max
+            if st.early_stop:
+                st.obj_done = True
+                return
+        meets_min = st.obj_count >= obj_min and st.se <= se_target
+        if self.run_type == "long" and st.open_count < 1:
+            meets_min = False
+        st.obj_done = meets_min or st.obj_count >= obj_max
 
     def _update_sr_reliability(self, item: Item, answer: Answer, domain_state: DomainState) -> None:
         if _sr_trap_failed(item, answer):
@@ -797,18 +1099,33 @@ class AdaptiveSession:
             return None
 
         st = self._policy_state()
-        if st.step >= self.global_cap:
+        effective_step = self.effective_steps if self.run_type == "long" else self._step
+        if effective_step >= self.global_cap:
             self.done = True
             return None
 
-        if self.policy.should_stop(st):
+        should_halt = self.policy.should_stop(st)
+        self.stop_reason = self.policy.stop_reason
+        if should_halt:
             self.done = True
             return None
         it = self.policy.next_item(st)
         if hasattr(self.policy, "_open_debug"):
             for dom, reason in getattr(self.policy, "_open_debug", {}).items():
-                if dom in self.state.domains:
-                    self.state.domains[dom].open_debug_reason = reason
+                if dom not in self.state.domains:
+                    continue
+                if isinstance(reason, set):
+                    reason_list = sorted(reason)
+                elif isinstance(reason, (list, tuple)):
+                    reason_list = [str(r) for r in reason if r]
+                elif reason:
+                    reason_list = [str(reason)]
+                else:
+                    reason_list = []
+                if reason_list:
+                    self.state.domains[dom].open_debug_reason = ",".join(reason_list)
+                else:
+                    self.state.domains[dom].open_debug_reason = None
         self._current = it
         if it is not None:
             vg = getattr(it, "variant_group", None)
@@ -837,6 +1154,8 @@ class AdaptiveSession:
         difficulty = int(getattr(it, "difficulty", 0) or 0)
         level_bucket = max(min(difficulty, 2), -2)
         is_obj = it.type in ("MCQ", "SJT")
+        info_delta = 0.0
+        correct_flag = 1 if float(credit) >= 0.5 else 0
 
         level_before_answer = int(ds.level)
         event_record: Optional[Dict[str, object]] = None
@@ -853,6 +1172,26 @@ class AdaptiveSession:
                 target_level=target_level,
             )
             self._info_hist.append(ds.info_total + ds.open_info_total)
+            info_delta = float(metrics.get("info_delta", 0.0))
+            if not correct_bool:
+                info_delta = 0.0
+
+            served_level = int(getattr(it, "_served_level", level_bucket))
+            if ds.last_obj_level is not None and abs(ds.last_obj_level - served_level) <= 1:
+                ds.long_stable_streak += 1
+            else:
+                ds.long_stable_streak = 1
+            ds.last_obj_level = served_level
+            ds.obj_diff_history.append(served_level)
+            if len(ds.obj_diff_history) > self.long_early_streak:
+                ds.obj_diff_history[:] = ds.obj_diff_history[-self.long_early_streak :]
+            delta_theta = abs(float(metrics.get("theta_after", 0.0)) - float(metrics.get("theta_before", 0.0)))
+            ds.obj_theta_deltas.append(delta_theta)
+            if len(ds.obj_theta_deltas) > self.long_early_streak:
+                ds.obj_theta_deltas[:] = ds.obj_theta_deltas[-self.long_early_streak :]
+
+            if self.run_type == "long":
+                self._maybe_trigger_long_early_stop(it.domain, ds)
 
             self._update_obj_done(ds)
 
@@ -926,6 +1265,16 @@ class AdaptiveSession:
                 except (TypeError, ValueError):
                     rubric_conf = None
 
+            rubric_score = float(credit)
+            is_god_probe = bool(getattr(it, "_god_probe", False))
+            if not is_god_probe and isinstance(getattr(it, "meta", None), dict):
+                is_god_probe = bool(getattr(it, "meta", {}).get("is_god_probe"))
+
+            tier_before_open = self._current_tier_label(it.domain)
+            if not is_god_probe and self.open_first_tier.get(it.domain) is None:
+                self.open_first_tier[it.domain] = tier_before_open
+                self.first_open_was_below_ss[it.domain] = tier_before_open not in {"SS", "GOD"}
+
             metrics = _apply_open_step(
                 ds,
                 level_bucket,
@@ -934,8 +1283,30 @@ class AdaptiveSession:
                 latency_ms,
                 rubric_conf,
             )
+
+            if not is_god_probe:
+                first_open_pending = self.first_open_rubric.get(it.domain) is None
+                if first_open_pending:
+                    self.first_open_rubric[it.domain] = rubric_score
+                if self.first_open_difficulty.get(it.domain) is None:
+                    served_level = metrics.get("b")
+                    raw_diff = getattr(it, "difficulty", served_level)
+                    try:
+                        diff_val = float(
+                            raw_diff if raw_diff is not None else served_level
+                        )
+                    except (TypeError, ValueError):
+                        diff_val = float(served_level if served_level is not None else 0.0)
+                    self.first_open_difficulty[it.domain] = diff_val
+                if (
+                    first_open_pending
+                    and self.first_open_was_below_ss.get(it.domain)
+                    and rubric_score >= PROD_GOD_RUBRIC0
+                ):
+                    self._append_god_probe_reason(it.domain, "probe_blocked_below_ss")
             self._update_obj_done(ds)
             self._info_hist.append(ds.info_total + ds.open_info_total)
+            info_delta = float(metrics.get("open_info_delta", 0.0))
 
             log.debug(
                 (
@@ -966,6 +1337,19 @@ class AdaptiveSession:
                 se=ds.se,
                 info_gain=metrics["open_info_delta"],
             )
+
+            if is_god_probe:
+                self.god_probe_pending[it.domain] = False
+                self.god_probe_used[it.domain] = True
+                self.god_probe_rubric[it.domain] = rubric_score
+                passed = bool(rubric_score >= PROD_GOD_RUBRIC1)
+                self.god_probe_passed[it.domain] = passed
+                if passed:
+                    self._append_god_probe_reason(it.domain, "god_awarded")
+                else:
+                    self._append_god_probe_reason(it.domain, "probe2_low_rubric")
+                if GOD_PROBE_EXEMPT_FROM_CAP:
+                    self.extra_steps_exempt += 1
 
             event_record = {
                 "t": timestamp,
@@ -1037,7 +1421,6 @@ class AdaptiveSession:
         self.last_domain_id = it.domain
         self._last_item_type = it.type
         self._current = None
-
         if event_record is None:
             event_record = {
                 "t": timestamp,
@@ -1055,6 +1438,12 @@ class AdaptiveSession:
             }
 
         self.state.audit_events.append(event_record)
+
+        self._record_fail_fast_stats(
+            is_objective=is_obj,
+            correct=bool(correct_flag),
+            info_gain=float(info_delta),
+        )
 
         if self._step >= self.global_cap:
             self.done = True
@@ -1112,6 +1501,8 @@ class AdaptiveSession:
         traps = count_traps(asked, self.state.answers)
 
         out_scores: List[DomainScore] = []
+        per_domain_summary: Dict[str, Dict[str, object]] = {}
+        totals = {"objectives": 0, "sr": 0, "open": 0}
         for d in DOMAINS:
             st = self.state.domains[d]
             score, composite_se, parts = _composite(d, st)
@@ -1153,9 +1544,27 @@ class AdaptiveSession:
                 accuracy_by_level=accuracy_by_level,
                 open_count=st.open_count,
                 open_ratings=open_ratings,
+                god_probe_used=self.god_probe_used.get(d),
+                god_probe_passed=self.god_probe_passed.get(d),
+                run_is_long=self.run_type == "long",
             )
             tier_label = map_tier(norm_ten, self.run_type, tier_state)
             tier_meta = getattr(tier_state, "_tier_meta", {})
+            tier_reasons = list(tier_meta.get("reasons", []))
+            god_gate_meta = tier_meta.get("god_gate")
+            if isinstance(god_gate_meta, dict):
+                for reason in god_gate_meta.get("reasons", []) or []:
+                    if reason not in tier_reasons:
+                        tier_reasons.append(reason)
+            open_reason = getattr(st, "open_debug_reason", None)
+            if open_reason:
+                if isinstance(open_reason, str):
+                    open_reason_list = [part.strip() for part in open_reason.split(",") if part]
+                else:
+                    open_reason_list = [str(part) for part in open_reason if part]
+                for reason in open_reason_list:
+                    if reason not in tier_reasons:
+                        tier_reasons.append(reason)
 
             reliability = {
                 "sr_mirror_ok": bool(st.sr_mirror_ok),
@@ -1187,6 +1596,7 @@ class AdaptiveSession:
             setattr(ds, "obj_info_total", st.obj_info_total)
             setattr(ds, "open_info_total", st.open_info_total)
             setattr(ds, "open_debug_reason", getattr(st, "open_debug_reason", None))
+            setattr(ds, "tier_reasons", tier_reasons)
             setattr(ds, "items_by_level", items_by_level)
             setattr(ds, "accuracy_by_level", accuracy_by_level)
             setattr(ds, "open_ratings", open_ratings)
@@ -1227,6 +1637,24 @@ class AdaptiveSession:
             setattr(ds, "latency_stats", latency_stats)
             out_scores.append(ds)
 
+            obj_used = int(st.mcq_total + st.sjt_total)
+            sr_used = int(st.sr_total)
+            open_used = int(st.open_total)
+            totals["objectives"] += obj_used
+            totals["sr"] += sr_used
+            totals["open"] += open_used
+            per_domain_summary[d] = {
+                "obj_used": obj_used,
+                "sr_used": sr_used,
+                "open_used": open_used,
+                "final_diff_idx": int(st.level),
+                "early_stop": bool(st.early_stop),
+                "early_stop_reason": st.early_stop_reason,
+                "se_final": float(st.se),
+                "theta_final": float(st.theta),
+                "open_floor_applied": bool(self.open_floor_applied.get(d, False)),
+            }
+
         top = [x.domain for x in sorted(out_scores, key=lambda x: x.norm_score, reverse=True)[:5]]
 
         cats = self._summary_categories()
@@ -1263,6 +1691,37 @@ class AdaptiveSession:
             "rt_baselines": self.base_rt,
             "total_items": int(total_items),
         }
+        summary["effective_steps"] = self.effective_steps
+        summary["extra_steps_exempt"] = int(self.extra_steps_exempt)
+        summary["open_first_tier"] = dict(self.open_first_tier)
+        summary["first_open_was_below_ss"] = dict(self.first_open_was_below_ss)
+        summary["open_floor_applied"] = dict(self.open_floor_applied)
+        summary["god_probe_enabled"] = self.god_probe_enabled
+        summary["long_early_stop_enabled"] = bool(
+            self.run_type == "long" and self.long_early_stop_enabled
+        )
+        summary["per_domain"] = per_domain_summary
+        summary["totals"] = totals
+        summary["per_domain_obj_count"] = {
+            domain: int(meta.get("obj_used", 0))
+            for domain, meta in per_domain_summary.items()
+        }
+        summary["obj_total"] = int(totals.get("objectives", 0))
+        summary["god_probe"] = {}
+        for domain in DOMAINS:
+            reasons = list(self.god_probe_reasons.get(domain, []))
+            summary["god_probe"][domain] = {
+                "first_rubric": self.first_open_rubric.get(domain),
+                "first_difficulty": self.first_open_difficulty.get(domain),
+                "open_first_tier": self.open_first_tier.get(domain),
+                "first_open_was_below_ss": bool(self.first_open_was_below_ss.get(domain)),
+                "probe2_rubric": self.god_probe_rubric.get(domain),
+                "probe2_served": bool(self.god_probe_used.get(domain)),
+                "passed": self.god_probe_passed.get(domain),
+                "pending": bool(self.god_probe_pending.get(domain)),
+                "reasons": reasons,
+                "probe_reason": reasons[-1] if reasons else None,
+            }
 
         cap = self.cap_limit
         obj_min = OBJ_MIN_SHORT if self.run_type == "short" else OBJ_MIN_LONG
@@ -1271,11 +1730,14 @@ class AdaptiveSession:
             for d in DOMAINS
         }
         remaining_minima = sum(shortfalls.values())
+        eff_steps = self.effective_steps
         meta = {
             "run": self.run_type,
             "cap": cap,
             "steps_total": int(self._step),
-            "steps_remaining": max(cap - self._step, 0),
+            "steps_remaining": max(cap - eff_steps, 0),
+            "effective_steps": eff_steps,
+            "extra_steps_exempt": int(self.extra_steps_exempt),
         }
         if remaining_minima > 0:
             meta["incomplete"] = True
@@ -1288,10 +1750,14 @@ class AdaptiveSession:
         summary["steps_total"] = int(self._step)
         summary["steps_used"] = int(self._step)
         summary["cap_limit"] = cap
-        summary["cap"] = f"{self._step}/{self.global_cap}"
-        summary["steps_remaining"] = max(cap - self._step, 0)
+        summary["cap"] = f"{eff_steps}/{self.global_cap}"
+        summary["steps_remaining"] = max(cap - eff_steps, 0)
         summary["sr_used"] = self.sr_used
         summary["open_used"] = self.open_used
+        summary["stop_reason"] = self.stop_reason
+        if os.getenv("STAGING_PROFILE"):
+            summary["ff_win_obj_len_short"] = self.ff_win_obj_len_short
+            summary["ff_win_obj_len_long"] = self.ff_win_obj_len_long
 
         # Write per-run item CSV
         run_id = os.getenv("RUN_ID", "")
@@ -1303,6 +1769,8 @@ class AdaptiveSession:
                      synergy_boost=0.0, unique_award=None, summary=summary)
         meta["sr_used"] = self.sr_used
         meta["open_used"] = self.open_used
+        if self.stop_reason:
+            meta["stop_reason"] = self.stop_reason
         setattr(res, "meta", meta)
         res.audit_events = [
             {k: v for k, v in evt.items()}
@@ -1314,6 +1782,12 @@ class AdaptiveSession:
 
     @property
     def steps(self) -> int:
+        return int(self._step)
+
+    @property
+    def effective_steps(self) -> int:
+        if GOD_PROBE_EXEMPT_FROM_CAP:
+            return max(0, int(self._step) - int(self.extra_steps_exempt))
         return int(self._step)
 
     @property
@@ -1331,7 +1805,40 @@ class AdaptiveSession:
             "cap_limit": cap,
             "sr_used": self.sr_used,
             "open_used": self.open_used,
+            "stop_reason": self.stop_reason,
+            "effective_steps": self.effective_steps,
+            "extra_steps_exempt": int(self.extra_steps_exempt),
+            "god_probe_enabled": self.god_probe_enabled,
+            "god_probe": {
+                domain: {
+                    "first_rubric": self.first_open_rubric.get(domain),
+                    "first_difficulty": self.first_open_difficulty.get(domain),
+                    "probe2_rubric": self.god_probe_rubric.get(domain),
+                    "probe2_served": bool(self.god_probe_used.get(domain)),
+                    "passed": self.god_probe_passed.get(domain),
+                    "pending": bool(self.god_probe_pending.get(domain)),
+                    "reasons": list(self.god_probe_reasons.get(domain, [])),
+                    "probe_reason": (
+                        self.god_probe_reasons.get(domain, [])[-1]
+                        if self.god_probe_reasons.get(domain)
+                        else None
+                    ),
+                }
+                for domain in DOMAINS
+            },
         }
+
+    @property
+    def ff_win_obj_len_short(self) -> int:
+        if self._short_ff_window <= 0:
+            return 0
+        return len(self._ff_correct_short)
+
+    @property
+    def ff_win_obj_len_long(self) -> int:
+        if self._long_ff_window <= 0:
+            return 0
+        return len(self._ff_correct_long)
 
     def mark_done(self) -> None:
         self.done = True
